@@ -1127,7 +1127,7 @@ impl StrMap {
 // ---------------------------------------------------------------- input files
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
+static PF_DIST: AtomicUsize = AtomicUsize::new(0);
 // debug accumulators (ns, summed over threads)
 static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 #[inline(always)]
@@ -1325,7 +1325,7 @@ const RING: usize = 16;
 /// prefetch a row's user-table slot and resolve it RING rows later.
 struct PState {
     ev: PartBuf<EvA>,
-    cl: Vec<ClA>,
+    cl: PartBuf<ClA>, // single partition; write-combined like the event scatter
     alloc: IdxAlloc,
     pe: [(EvA, u64, u64, u32); RING],
     pe_pos: usize,
@@ -1339,7 +1339,7 @@ impl PState {
         let zc = ClA { cid: 0, user: 0, ts: 0, camp: 0, _pad: 0 };
         PState {
             ev: PartBuf::new(npart, per_part),
-            cl: Vec::with_capacity(cl_cap),
+            cl: PartBuf::new(1, cl_cap),
             alloc: IdxAlloc { next: 0, end: 0 },
             pe: [(ze, 0, 0, 0); RING],
             pe_pos: 0,
@@ -1366,7 +1366,7 @@ impl PState {
         if self.pc_pos >= RING {
             let (mut r, h, s) = self.pc[i];
             r.user = ut.get_or_insert(h, s, &mut self.alloc);
-            self.cl.push(r);
+            self.cl.push(0, r);
         }
         self.pc[i] = (rec, uid_h, uref);
         self.pc_pos += 1;
@@ -1385,7 +1385,7 @@ impl PState {
             let i = (self.pc_pos - n + k) & (RING - 1);
             let (mut r, h, s) = self.pc[i];
             r.user = ut.get_or_insert(h, s, &mut self.alloc);
-            self.cl.push(r);
+            self.cl.push(0, r);
         }
         self.pc_pos = 0;
     }
@@ -2474,7 +2474,7 @@ fn main() {
     let use_simd = false;
     struct P1 {
         ev: PartBuf<EvA>,
-        cl: Vec<ClA>,
+        cl: PartBuf<ClA>,
     }
     let p1: Vec<P1> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
@@ -2561,6 +2561,7 @@ fn main() {
                     }
                     st.flush(ut);
                     st.ev.finish();
+                    st.cl.finish();
                     P1 { ev: st.ev, cl: st.cl }
                 })
             })
@@ -2581,7 +2582,7 @@ fn main() {
     const CL_PIECE: usize = 1 << 16;
     let mut cl_items: Vec<(usize, usize, usize)> = Vec::new();
     for (t, r) in p1.iter().enumerate() {
-        let n = r.cl.len();
+        let n = r.cl.len(0);
         let mut a = 0;
         while a < n {
             let b = (a + CL_PIECE).min(n);
@@ -2693,16 +2694,28 @@ fn main() {
                         } else {
                             let t_c = Instant::now();
                             let (t, a, b) = cl_items[i - npart];
-                            let v = &p1[t].cl[a..b];
-                            for (k, c) in v.iter().enumerate() {
-                                if k + 16 < v.len() {
-                                    prefetch(unsafe { parent.as_ptr().add(v[k + 16].user as usize) });
+                            let cm = p1[t].cl.main(0);
+                            let co = p1[t].cl.over(0);
+                            // items index the concatenation main ++ over
+                            let v: &[ClA] = if b <= cm.len() {
+                                &cm[a..b]
+                            } else if a >= cm.len() {
+                                &co[a - cm.len()..b - cm.len()]
+                            } else {
+                                &cm[a..]
+                            };
+                            let v2: &[ClA] = if a < cm.len() && b > cm.len() { &co[..b - cm.len()] } else { &[] };
+                            for v in [v, v2] {
+                                for (k, c) in v.iter().enumerate() {
+                                    if k + 16 < v.len() {
+                                        prefetch(unsafe { parent.as_ptr().add(v[k + 16].user as usize) });
+                                    }
+                                    let person = person_of(parent, c.user);
+                                    r.cl.push(
+                                        (person >> shift2) as usize,
+                                        ClB { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 },
+                                    );
                                 }
-                                let person = person_of(parent, c.user);
-                                r.cl.push(
-                                    (person >> shift2) as usize,
-                                    ClB { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 },
-                                );
                             }
                             tadd(2, t_c);
                         }
