@@ -2962,6 +2962,27 @@ fn main() {
     T0.get_or_init(Instant::now);
     init_cpus();
 
+    {
+        // EXPERIMENT (measurement only): fault in and release 1 GB of fresh memory on all threads,
+        // to measure what fresh pages cost on the scoring machine. Output is unaffected.
+        let n = std::env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).max(1);
+        let per = (1usize << 30) / n;
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(move || {
+                    let mut v: Vec<u8> = Vec::with_capacity(per);
+                    let p = v.as_mut_ptr();
+                    let mut i = 0;
+                    while i < per {
+                        unsafe { p.add(i).write_volatile(1) };
+                        i += 4096;
+                    }
+                    drop(v);
+                });
+            }
+        });
+        log("touched 1 GB");
+    }
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
         (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
