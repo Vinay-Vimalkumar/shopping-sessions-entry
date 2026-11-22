@@ -212,6 +212,43 @@ impl<T: Copy> PartBuf<T> {
     }
 }
 
+/// CPUs this process may run on (read once, before any thread is pinned).
+static CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+
+fn init_cpus() {
+    CPUS.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                return (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect();
+            }
+        }
+        Vec::new()
+    });
+}
+
+/// Pin worker t to the t-th allowed CPU (keeps its staging buffers and partitions in one core's caches).
+fn pin_thread(t: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let cpus = match CPUS.get() {
+            Some(c) => c,
+            None => return,
+        };
+        if cpus.len() < 2 || std::env::var_os("SS_NOPIN").is_some() {
+            return;
+        }
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpus[t % cpus.len()], &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = t;
+}
+
 /// Release big structures on several threads at once (process teardown is otherwise serial).
 fn par_drop<T: Send>(items: Vec<T>) {
     std::thread::scope(|s| {
@@ -2333,6 +2370,7 @@ fn sort_u64(v: &mut [u64]) {
 // ---------------------------------------------------------------- main
 fn main() {
     T0.get_or_init(Instant::now);
+    init_cpus();
 
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
@@ -2546,6 +2584,7 @@ fn main() {
                 let parent_cell = &parent_cell;
                 let ut = &ut;
                 s.spawn(move || {
+                    pin_thread(t);
                     let mut st = PState::new(npart, per_part, cl_cap);
                     // links first: all threads parse and intern link chunks
                     loop {
@@ -2657,12 +2696,13 @@ fn main() {
     let cl_out_cap = est_cl * 11 / 10 / npart2 / nthreads + 32;
     let p2: Vec<P2> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
+            .map(|t| {
                 let p1 = &p1;
                 let parent = &parent;
                 let cl_items = &cl_items;
                 let next = &next;
                 s.spawn(move || {
+                    pin_thread(t);
                     let mut r = P2 { ev: PartBuf::new(npart2, ev_out_cap), cl: PartBuf::new(npart2, cl_out_cap) };
                     // dedup table: (key, ingest, idx)
                     // dedup table slots: (key, ingest, gen << 24 | idx); a slot is empty unless its
@@ -2802,12 +2842,13 @@ fn main() {
     let next = AtomicUsize::new(0);
     let workers: Vec<Worker> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
+            .map(|t| {
                 let p2 = &p2;
                 let next = &next;
                 let ut = &ut;
                 let order = &order;
                 s.spawn(move || {
+                    pin_thread(t);
                     let mut w = Worker::new(ncamp, ndays, ncat);
                     w.ensure_cells(ncells);
                     w.set_window(ncamp, win_dshift, win_nd);
