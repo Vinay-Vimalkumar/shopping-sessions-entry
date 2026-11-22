@@ -2376,12 +2376,14 @@ fn main() {
     }
 
     // ---------------- phase 1: parse (thread 0 builds the union-find from links first)
-    let est_ev = ev_bytes / 75 + 1024;
-    let per_part = est_ev * 3 / 2 / npart / nthreads + 64;
+    // arena slack is kept small: with huge pages the whole arena gets committed (and zeroed);
+    // rare excess spills into per-partition overflow vectors
+    let est_ev = ev_bytes / 80 + 1024;
+    let per_part = est_ev * 23 / 20 / npart / nthreads + 32;
     let cl_bytes: usize = cl_files.iter().map(|f| f.len()).sum();
     let ln_bytes: usize = ln_files.iter().map(|f| f.len()).sum();
-    let est_cl = cl_bytes / 50 + 1024;
-    let cl_cap = est_cl * 3 / 2 / nthreads + 1024;
+    let est_cl = cl_bytes / 52 + 1024;
+    let cl_cap = est_cl * 13 / 10 / nthreads + 1024;
     // distinct user IDs are ~8% of event rows; size for ~2.5x that (load stays < 0.45)
     let est_users = (est_ev + est_cl) / 12 + ln_bytes / 16 + 4096;
     let cap_slots = est_users.next_power_of_two().max(1 << 16);
@@ -2518,8 +2520,8 @@ fn main() {
         ev: PartBuf<EvB>,
         cl: PartBuf<ClB>,
     }
-    let ev_out_cap = est_ev * 3 / 2 / npart2 / nthreads + 64;
-    let cl_out_cap = est_cl * 3 / 2 / npart2 / nthreads + 64;
+    let ev_out_cap = est_ev * 21 / 20 / npart2 / nthreads + 32;
+    let cl_out_cap = est_cl * 11 / 10 / npart2 / nthreads + 32;
     let p2: Vec<P2> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
