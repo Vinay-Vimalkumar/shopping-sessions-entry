@@ -2720,14 +2720,43 @@ fn main() {
 
     // products / categories
     let prows = read_table2(&data_dir.join("products.csv"));
-    let mut cats: Vec<&'static [u8]> = prows.iter().map(|r| r.1).collect();
-    cats.push(b"unknown");
-    cats.sort();
-    cats.dedup();
-    assert!(cats.len() <= 256, "too many categories");
-    let cat_idx = |c: &[u8]| cats.binary_search_by(|x| (*x).cmp(c)).unwrap() as u32;
-    let unknown_cat = cat_idx(b"unknown");
-    let pitems: Vec<(&'static [u8], u32)> = prows.iter().map(|r| (r.0, cat_idx(r.1))).collect();
+    // Distinct category names through a small exact hash table (sorting one name per product was
+    // the slowest part of start-up); at most 256 categories, "unknown" included.
+    let mut uniq: Vec<&'static [u8]> = Vec::new();
+    let mut pcat: Vec<u32> = Vec::with_capacity(prows.len());
+    let unk = {
+        const TS: usize = 1024;
+        let mut tab: Vec<u32> = vec![u32::MAX; TS];
+        let mut intern = |c: &'static [u8], uniq: &mut Vec<&'static [u8]>| -> u32 {
+            let mut i = (xxh3_64(c) as usize) & (TS - 1);
+            loop {
+                let u = tab[i];
+                if u == u32::MAX {
+                    assert!(uniq.len() < 256, "too many categories");
+                    tab[i] = uniq.len() as u32;
+                    uniq.push(c);
+                    return tab[i];
+                }
+                if uniq[u as usize] == c {
+                    return u;
+                }
+                i = (i + 1) & (TS - 1);
+            }
+        };
+        for r in prows.iter() {
+            pcat.push(intern(r.1, &mut uniq));
+        }
+        intern(b"unknown", &mut uniq)
+    };
+    let mut corder: Vec<u32> = (0..uniq.len() as u32).collect();
+    corder.sort_by(|&a, &b| uniq[a as usize].cmp(uniq[b as usize]));
+    let cats: Vec<&'static [u8]> = corder.iter().map(|&i| uniq[i as usize]).collect();
+    let mut crank = vec![0u32; uniq.len()];
+    for (r, &i) in corder.iter().enumerate() {
+        crank[i as usize] = r as u32;
+    }
+    let unknown_cat = crank[unk as usize];
+    let pitems: Vec<(&'static [u8], u32)> = prows.iter().zip(pcat.iter()).map(|(r, &c)| (r.0, crank[c as usize])).collect();
     let products = StrMap::new(&pitems);
 
     // campaigns (dedup by id, last wins)
