@@ -2060,8 +2060,60 @@ fn sort_u64(v: &mut [u64]) {
 }
 
 // ---------------------------------------------------------------- main
+fn diag_report() {
+    #[cfg(target_os = "linux")]
+    {
+        let rd = |p: &str| std::fs::read_to_string(p).unwrap_or_else(|e| format!("<{e}>"));
+        let cpu = rd("/proc/cpuinfo");
+        let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").to_string();
+        let nproc = cpu.lines().filter(|l| l.starts_with("processor")).count();
+        let flags = cpu.lines().find(|l| l.starts_with("flags")).unwrap_or("");
+        eprintln!("DIAG cpu: {model} | nproc {nproc} | avx512f {} | avx2 {}", flags.contains("avx512f"), flags.contains(" avx2"));
+        eprintln!("DIAG thp enabled: {} | defrag: {}", rd("/sys/kernel/mm/transparent_hugepage/enabled").trim(), rd("/sys/kernel/mm/transparent_hugepage/defrag").trim());
+        eprintln!("DIAG kernel: {}", rd("/proc/version").trim());
+        let mi = rd("/proc/meminfo");
+        for l in mi.lines().filter(|l| l.starts_with("MemTotal") || l.starts_with("MemFree") || l.starts_with("MemAvailable") || l.starts_with("Cached") || l.starts_with("AnonHugePages") || l.starts_with("HugePages_Total")) {
+            eprintln!("DIAG mem: {l}");
+        }
+        let st = rd("/proc/self/status");
+        for l in st.lines().filter(|l| l.starts_with("VmHWM") || l.starts_with("VmRSS") || l.starts_with("Cpus_allowed_list")) {
+            eprintln!("DIAG self: {l}");
+        }
+        let sm = rd("/proc/self/smaps_rollup");
+        for l in sm.lines().filter(|l| l.starts_with("AnonHugePages") || l.starts_with("Rss") || l.starts_with("Anonymous")) {
+            eprintln!("DIAG smaps: {l}");
+        }
+        eprintln!("DIAG cgroup cpu.max: {} | memory.max: {}", rd("/sys/fs/cgroup/cpu.max").trim(), rd("/sys/fs/cgroup/memory.max").trim());
+        // page-fault probes: 256 MB touched every 4 KB, single thread
+        for huge in [false, true] {
+            unsafe {
+                let sz = 256usize << 20;
+                let t = Instant::now();
+                let p = libc::mmap(std::ptr::null_mut(), sz, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0) as *mut u8;
+                if huge {
+                    libc::madvise(p as *mut libc::c_void, sz, libc::MADV_HUGEPAGE);
+                }
+                let mut k = 0;
+                while k < sz {
+                    *p.add(k) = 1;
+                    k += 4096;
+                }
+                let t1 = t.elapsed().as_secs_f64() * 1e3;
+                let sm = rd("/proc/self/smaps_rollup");
+                let ahp = sm.lines().find(|l| l.starts_with("AnonHugePages")).unwrap_or("").to_string();
+                let t2 = Instant::now();
+                libc::munmap(p as *mut libc::c_void, sz);
+                let t3 = t2.elapsed().as_secs_f64() * 1e3;
+                eprintln!("DIAG fault probe huge={huge}: touch 256MB {t1:.1} ms, munmap {t3:.1} ms, {ahp}");
+            }
+        }
+        // file read probe: time to touch all input pages again (already mapped)
+    }
+}
+
 fn main() {
     T0.get_or_init(Instant::now);
+    let _ = LOG_ON.set(true);
 
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
@@ -2569,6 +2621,9 @@ fn main() {
         fs::write(cd.join("part-000.parquet"), bytes).expect("write campaign_daily");
     });
     log("phase 4 write done");
+    diag_report();
+    log("diag done; exiting 1 on purpose (diagnostic build)");
+    std::process::exit(1);
     par_drop(workers);
     log("released");
     fast_exit(nthreads);
