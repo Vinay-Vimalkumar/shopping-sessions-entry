@@ -10,8 +10,9 @@ How it works:
    and field boundaries 64 bytes at a time with AVX2 comma/newline/quote bitmasks, and check the
    quoting rules with a popcount; timestamps use a small month table plus SWAR digit decoding,
    with exact slow paths for anything unusual.
-2. Link files are parsed first by all threads; one thread then runs a prefetching union-find
-   (each person named by its byte-wise smallest ID) while the others parse events and clicks.
+2. Every user ID is interned once during parsing into a concurrent lock-free table (dense indices,
+   prefetched lookups). Link files are parsed first; one thread runs a prefetching union-find over
+   the dense indices (each person named by its byte-wise smallest ID) while the others parse.
 3. Events are scattered into 512 partitions by a 128-bit `event_id` hash (64-bit key, partition
    from independent bits) into per-thread arenas; each partition is deduplicated with a
    cache-resident open-addressing table (smallest `ingest_ts` wins, before validation).
