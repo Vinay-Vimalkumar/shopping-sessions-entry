@@ -1378,7 +1378,7 @@ fn part_of(h: u64, shift: u32) -> usize {
     (h >> shift) as usize
 }
 
-const RING: usize = 16;
+const RING: usize = 32;
 
 /// Per-thread parse state: output buffers, user-index allocator, and small pipelines that
 /// prefetch a row's user-table slot and resolve it RING rows later.
