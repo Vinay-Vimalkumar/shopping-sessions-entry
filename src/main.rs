@@ -1779,6 +1779,15 @@ struct UserRow {
     top: u32, // u32::MAX = null
 }
 
+/// Credited-campaign accumulator for one (campaign, day).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CStat {
+    sessions: u32,
+    purchasing: u32,
+    revenue: u64,
+}
+
 /// Click as stored per person: sorted by (ts, click_id)
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1789,8 +1798,14 @@ struct ClC {
 }
 
 struct Worker {
-    // campaign stats: [camp * ndays + day] -> sessions, purchasing, revenue, assisted
+    // campaign stats export: [camp * ndays + day] -> sessions, purchasing, revenue, assisted
+    // (filled by finalize_stats from the compact arrays below)
     stats: Vec<[u64; 4]>,
+    // compact, cache-friendly accumulators over event-window days only
+    cstat: Vec<CStat>,
+    casg: Vec<u32>,
+    nd: usize,
+    dshift: u32,
     ndays: usize,
     ncat: usize,
     cnt: Vec<u32>,
@@ -1828,6 +1843,10 @@ impl Worker {
     fn new(ncamp: usize, ndays: usize, ncat: usize) -> Self {
         Worker {
             stats: vec![[0; 4]; (ncamp + 1) * ndays],
+            cstat: Vec::new(),
+            casg: Vec::new(),
+            nd: 0,
+            dshift: 0,
             ndays,
             ncat,
             cnt: vec![0; ncamp + 1],
@@ -1857,6 +1876,33 @@ impl Worker {
             cbits: Vec::new(),
             sess_cnt: Vec::new(),
             dcat: vec![0; ndays * ncat],
+        }
+    }
+
+    /// Event-window day range: base-relative day of the window's first day, and its day count.
+    fn set_window(&mut self, ncamp: usize, dshift: u32, nd: usize) {
+        self.dshift = dshift;
+        self.nd = nd;
+        self.cstat = vec![CStat { sessions: 0, purchasing: 0, revenue: 0 }; (ncamp + 1) * nd];
+        self.casg = vec![0; (ncamp + 1) * nd];
+    }
+
+    /// Fold the compact accumulators into the export layout used by the writer.
+    fn finalize_stats(&mut self) {
+        let nd = self.nd;
+        let ncamp1 = self.cstat.len() / nd.max(1);
+        for c in 0..ncamp1 {
+            for d in 0..nd {
+                let cs = self.cstat[c * nd + d];
+                let a = self.casg[c * nd + d];
+                if cs.sessions != 0 || a != 0 {
+                    let st = &mut self.stats[c * self.ndays + d + self.dshift as usize];
+                    st[0] += cs.sessions as u64;
+                    st[1] += cs.purchasing as u64;
+                    st[2] += cs.revenue;
+                    st[3] += a as u64;
+                }
+            }
         }
     }
 
@@ -2007,7 +2053,9 @@ impl Worker {
             let lo = k0.max(first);
             let hi = k1.min(end);
             if hi > lo {
-                self.stats[c * self.ndays + day as usize][3] += (hi - lo) as u64;
+                unsafe {
+                    *self.casg.get_unchecked_mut(c * self.nd + (day - self.dshift) as usize) += (hi - lo) as u32;
+                }
             }
             r += 1;
         }
@@ -2225,10 +2273,12 @@ impl Worker {
                 organic
             };
             let rev = self.sess_rev[k];
-            let st = &mut self.stats[credited * self.ndays + self.sess_day[k] as usize];
-            st[0] += 1;
-            st[1] += (rev > 0) as u64;
-            st[2] += rev;
+            let st = unsafe {
+                self.cstat.get_unchecked_mut(credited * self.nd + (self.sess_day[k] - self.dshift) as usize)
+            };
+            st.sessions += 1;
+            st.purchasing += (rev > 0) as u32;
+            st.revenue += rev;
         }
         if !self.touched.is_empty() {
             let touched = std::mem::take(&mut self.touched);
@@ -2741,6 +2791,9 @@ fn main() {
     // ---------------- phase 3: per person partition
     let ncat = cats.len();
     let ncells = (cx.ev_hi / GAP_MS) as usize + 2;
+    // sessions start inside the event window: its days, relative to base_day_off
+    let win_dshift = (ws.div_euclid(DAY_MS) - base_day_off) as u32;
+    let win_nd = ((we - 1).div_euclid(DAY_MS) - ws.div_euclid(DAY_MS) + 1) as usize;
     // largest partitions first (a whale person makes one partition much bigger)
     let mut order: Vec<usize> = (0..npart2).collect();
     let psize: Vec<usize> = (0..npart2).map(|q| p2.iter().map(|t| t.ev.len(q)).sum()).collect();
@@ -2756,6 +2809,7 @@ fn main() {
                 s.spawn(move || {
                     let mut w = Worker::new(ncamp, ndays, ncat);
                     w.ensure_cells(ncells);
+                    w.set_window(ncamp, win_dshift, win_nd);
                     let mut evp: Vec<&[EvB]> = Vec::with_capacity(p2.len() * 2);
                     let mut clp: Vec<&[ClB]> = Vec::with_capacity(p2.len() * 2);
                     loop {
@@ -2776,6 +2830,7 @@ fn main() {
                         let qsize = 1usize << shift2;
                         w.partition(&evp, &clp, qbase, qsize, base, base_day_off, organic, ut);
                     }
+                    w.finalize_stats();
                     w
                 })
             })
