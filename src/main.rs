@@ -16,8 +16,6 @@ const GAP_MS: u32 = 1_800_000;
 const WEEK_MS: i64 = 604_800_000;
 const LATE_MS: i64 = 86_400_000;
 
-const PBITS: u32 = 9;
-const NPART: usize = 1 << PBITS;
 
 // ---------------------------------------------------------------- allocator
 // Big allocations come straight from mmap with transparent huge pages requested: fewer page
@@ -325,6 +323,121 @@ unsafe fn scan_lines<F: FnMut(usize, usize, &[u32; 8], usize, u32)>(data: &[u8],
             }
             return;
         }
+    }
+}
+
+/// Line-at-a-time kernel: for each line starting in [start, end), find its newline, commas and
+/// quotes from 128-byte bitmask windows, resolve exactly N fields (quotes stripped, branch-free
+/// validation from the quote mask) and call f. Malformed lines are skipped. Lines of 128+ bytes
+/// take the exact scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,popcnt")]
+unsafe fn scan_fields<const N: usize, F: FnMut(&[&'static [u8]; N])>(
+    data: &'static [u8],
+    start: usize,
+    end: usize,
+    f: &mut F,
+) {
+    let len = data.len();
+    let mut s = start;
+    if s > 0 && *data.get_unchecked(s - 1) != b'\n' {
+        match memchr::memchr(b'\n', &data[s..]) {
+            Some(i) => s += i + 1,
+            None => return,
+        }
+    }
+    let mut pad: [u8; 128];
+    while s < end && s < len {
+        let avail = len - s;
+        let p: *const u8 = if avail >= 128 {
+            data.as_ptr().add(s)
+        } else {
+            pad = [0u8; 128];
+            pad[..avail].copy_from_slice(&data[s..]);
+            pad.as_ptr()
+        };
+        let (n0, c0, q0) = masks64(p);
+        let e: usize;
+        let cm: u128;
+        let qm: u128;
+        if n0 != 0 {
+            let ee = n0.trailing_zeros();
+            let below = (1u64 << ee) - 1;
+            e = ee as usize;
+            cm = (c0 & below) as u128;
+            qm = (q0 & below) as u128;
+        } else {
+            let (n1, c1, q1) = masks64(p.add(64));
+            if n1 != 0 {
+                let ee = n1.trailing_zeros();
+                let below = (1u64 << ee) - 1;
+                e = 64 + ee as usize;
+                cm = (c0 as u128) | (((c1 & below) as u128) << 64);
+                qm = (q0 as u128) | (((q1 & below) as u128) << 64);
+            } else if avail < 128 {
+                // final line of the file, no trailing newline
+                e = avail;
+                cm = (c0 as u128) | ((c1 as u128) << 64);
+                qm = (q0 as u128) | ((q1 as u128) << 64);
+            } else {
+                // long line: exact scalar path
+                let le = match memchr::memchr(b'\n', &data[s..]) {
+                    Some(i) => s + i,
+                    None => len,
+                };
+                let mut fl: [&'static [u8]; N] = [&[]; N];
+                if split_fields(&data[s..le], &mut fl) {
+                    f(&fl);
+                }
+                s = le + 1;
+                continue;
+            }
+        }
+        if cm.count_ones() as usize == N - 1 {
+            let base = data.as_ptr().add(s);
+            let mut fl: [&'static [u8]; N] = [&[]; N];
+            let mut bits = cm;
+            let mut st = 0usize;
+            let q = qm.count_ones();
+            if q == 0 {
+                for k in 0..N {
+                    let en = if k + 1 < N {
+                        let c = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        c
+                    } else {
+                        e
+                    };
+                    *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st), en - st);
+                    st = en + 1;
+                }
+                f(&fl);
+            } else {
+                let mut expect = 0u32;
+                let mut bad = 0u32;
+                for k in 0..N {
+                    let en = if k + 1 < N {
+                        let c = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        c
+                    } else {
+                        e
+                    };
+                    let n = en - st;
+                    let qd = ((qm >> st) & 1) as u32;
+                    let ql = ((qm >> (en.wrapping_sub(1) & 127)) & 1) as u32;
+                    bad |= qd & (((n < 2) as u32) | (ql ^ 1));
+                    expect += 2 * qd;
+                    let o = qd as usize;
+                    *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st + o), n.saturating_sub(2 * o));
+                    st = en + 1;
+                }
+                if bad == 0 && expect == q {
+                    f(&fl);
+                }
+            }
+        }
+        s += e + 1;
     }
 }
 
@@ -978,11 +1091,12 @@ struct Ctx {
     campaigns: StrMap,
     unknown_cat: u32,
     dates: DateTab,
+    pshift: u32,
 }
 
 #[inline(always)]
-fn part_of(h: u64) -> usize {
-    (h >> (64 - PBITS)) as usize
+fn part_of(h: u64, shift: u32) -> usize {
+    (h >> shift) as usize
 }
 
 #[inline(always)]
@@ -1002,7 +1116,7 @@ fn event_fields(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut PartBuf<EvA>) {
     }
     let h128 = xxh3_128(eid);
     let key = h128 as u64;
-    let part = part_of((h128 >> 64) as u64);
+    let part = part_of((h128 >> 64) as u64, cx.pshift);
     let ingest_s = parse_f1_fast(f[3], &cx.dates);
 
     let ingest = match ingest_s {
@@ -1655,19 +1769,93 @@ fn main() {
         campaigns,
         unknown_cat,
         dates: DateTab::new(ws - 9 * DAY_MS, we + 7 * DAY_MS),
+        pshift: 0,
     };
+    let mut cx = cx;
 
     // files
     let ev_files: Vec<&'static [u8]> = csv_files(&data_dir.join("events")).iter().map(|p| map_file(p)).collect();
     let cl_files: Vec<&'static [u8]> = csv_files(&data_dir.join("clicks")).iter().map(|p| map_file(p)).collect();
     let ln_files: Vec<&'static [u8]> = csv_files(&data_dir.join("links")).iter().map(|p| map_file(p)).collect();
     let ev_bytes: usize = ev_files.iter().map(|f| f.len()).sum();
+    // partitions sized to stay L2-resident: ~12K event rows each
+    let est_rows = ev_bytes / 75 + 1;
+    let mut pbits = 8u32;
+    while pbits < 12 && (est_rows >> pbits) > 12_000 {
+        pbits += 1;
+    }
+    let npart: usize = 1 << pbits;
+    let pshift = 64 - pbits;
+    cx.pshift = pshift;
+    let cx = cx;
     let mut chunks = Vec::new();
     make_chunks(Kind::Event, &ev_files, 2 << 20, &mut chunks);
     make_chunks(Kind::Click, &cl_files, 2 << 20, &mut chunks);
     let mut lchunks = Vec::new();
     make_chunks(Kind::Link, &ln_files, 256 << 10, &mut lchunks);
     log(&format!("setup done: {} chunks, {} threads, ndays {}", chunks.len(), nthreads, ndays));
+    if let Ok(mode) = std::env::var("SS_BENCH") {
+        // debug micro-benchmark: single thread over all event chunks
+        let mut acc = 0usize;
+        for &f in ev_files.iter() {
+            for k in (0..f.len()).step_by(4096) {
+                acc = acc.wrapping_add(f[k] as usize);
+            }
+        }
+        let t = Instant::now();
+        let mut lines = 0usize;
+        let mut ok = 0usize;
+        let mut dummy = PartBuf::<EvA>::new(npart, 4);
+        for c in chunks.iter().filter(|c| c.kind == Kind::Event) {
+            let data = c.data;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let mut cb = |ls: usize, le: usize, seps: &[u32; 8], nsep: usize, q: u32| {
+                    lines += 1;
+                    if mode == "scan" {
+                        acc = acc.wrapping_add(ls ^ le ^ nsep ^ q as usize ^ seps[3] as usize);
+                        return;
+                    }
+                    let mut f: [&'static [u8]; 7] = [&[]; 7];
+                    if fields_from_scan::<7>(data, ls, le, seps, nsep, q, &mut f) {
+                        ok += 1;
+                        if mode == "split" {
+                            acc = acc.wrapping_add(f[3].len() ^ f[5].as_ptr() as usize);
+                            return;
+                        }
+                        if mode == "hash" {
+                            acc = acc.wrapping_add(xxh3_128(f[0]) as usize ^ xxh3_64(f[1]) as usize);
+                            return;
+                        }
+                        if mode == "ts" {
+                            acc = acc.wrapping_add(parse_ts_fast(f[2], &cx.dates).unwrap_or(0) as usize ^ parse_f1_fast(f[3], &cx.dates).unwrap_or(0) as usize);
+                            return;
+                        }
+                        event_fields(&f, &cx, &mut dummy);
+                    }
+                };
+                if mode.ends_with('2') {
+                    let mut cb2 = |f: &[&'static [u8]; 7]| {
+                        lines += 1;
+                        ok += 1;
+                        if mode == "split2" {
+                            acc = acc.wrapping_add(f[3].len() ^ f[5].as_ptr() as usize);
+                            return;
+                        }
+                        event_fields(f, &cx, &mut dummy);
+                    };
+                    scan_fields::<7, _>(data, c.start, c.end, &mut cb2);
+                } else {
+                    scan_lines(data, c.start, c.end, &mut cb);
+                }
+            }
+            dummy.lens.iter_mut().for_each(|l| *l = 0);
+            dummy.over.iter_mut().for_each(|v| v.clear());
+        }
+        let el = t.elapsed().as_secs_f64() * 1e9;
+        eprintln!("bench {mode}: {lines} lines, {ok} ok, {:.1} ns/line ({})", el / lines as f64, acc & 1);
+        std::process::exit(0);
+    }
     if std::env::var_os("SS_PRETOUCH").is_some() {
         // debug: fault in all input pages first, to separate page-fault cost from parse cost
         let all: Vec<&'static [u8]> = ev_files.iter().chain(cl_files.iter()).chain(ln_files.iter()).copied().collect();
@@ -1693,7 +1881,7 @@ fn main() {
 
     // ---------------- phase 1: parse (thread 0 builds persons from links first)
     let est_ev = ev_bytes / 75 + 1024;
-    let per_part = est_ev * 3 / 2 / NPART / nthreads + 64;
+    let per_part = est_ev * 3 / 2 / npart / nthreads + 64;
     let cl_bytes: usize = cl_files.iter().map(|f| f.len()).sum();
     let est_cl = cl_bytes / 50 + 1024;
     let cl_cap = est_cl * 3 / 2 / nthreads + 1024;
@@ -1734,13 +1922,8 @@ fn main() {
                         if use_simd {
                             #[cfg(target_arch = "x86_64")]
                             unsafe {
-                                let mut cb = |ls: usize, le: usize, seps: &[u32; 8], nsep: usize, q: u32| {
-                                    let mut f: [&'static [u8]; 2] = [&[]; 2];
-                                    if fields_from_scan::<2>(data, ls, le, seps, nsep, q, &mut f) {
-                                        link_fields(&f, &mut v);
-                                    }
-                                };
-                                scan_lines(data, c.start, c.end, &mut cb);
+                                let mut cb = |f: &[&'static [u8]; 2]| link_fields(f, &mut v);
+                                scan_fields::<2, _>(data, c.start, c.end, &mut cb);
                             }
                         } else {
                             for_lines(data, c.start, c.end, |l| {
@@ -1765,7 +1948,7 @@ fn main() {
                         log(&format!("links done: {} ids, {} persons", p.map.len, p.people.len()));
                         let _ = persons_cell.set(p);
                     }
-                    let mut r = P1 { ev: PartBuf::new(NPART, per_part), cl: Vec::with_capacity(cl_cap) };
+                    let mut r = P1 { ev: PartBuf::new(npart, per_part), cl: Vec::with_capacity(cl_cap) };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= chunks.len() {
@@ -1778,22 +1961,12 @@ fn main() {
                             unsafe {
                                 match c.kind {
                                     Kind::Event => {
-                                        let mut cb = |ls: usize, le: usize, seps: &[u32; 8], nsep: usize, q: u32| {
-                                            let mut f: [&'static [u8]; 7] = [&[]; 7];
-                                            if fields_from_scan::<7>(data, ls, le, seps, nsep, q, &mut f) {
-                                                event_fields(&f, cx, &mut r.ev);
-                                            }
-                                        };
-                                        scan_lines(data, c.start, c.end, &mut cb);
+                                        let mut cb = |f: &[&'static [u8]; 7]| event_fields(f, cx, &mut r.ev);
+                                        scan_fields::<7, _>(data, c.start, c.end, &mut cb);
                                     }
                                     Kind::Click => {
-                                        let mut cb = |ls: usize, le: usize, seps: &[u32; 8], nsep: usize, q: u32| {
-                                            let mut f: [&'static [u8]; 4] = [&[]; 4];
-                                            if fields_from_scan::<4>(data, ls, le, seps, nsep, q, &mut f) {
-                                                click_fields(&f, cx, &mut r.cl);
-                                            }
-                                        };
-                                        scan_lines(data, c.start, c.end, &mut cb);
+                                        let mut cb = |f: &[&'static [u8]; 4]| click_fields(f, cx, &mut r.cl);
+                                        scan_fields::<4, _>(data, c.start, c.end, &mut cb);
                                     }
                                     Kind::Link => {}
                                 }
@@ -1828,13 +2001,13 @@ fn main() {
         }
     }
     let next = AtomicUsize::new(0);
-    let total_items = NPART + cl_items.len();
+    let total_items = npart + cl_items.len();
     struct P2 {
         ev: PartBuf<EvB>,
         cl: PartBuf<ClB>,
     }
-    let ev_out_cap = est_ev * 3 / 2 / NPART / nthreads + 64;
-    let cl_out_cap = est_cl * 3 / 2 / NPART / nthreads + 64;
+    let ev_out_cap = est_ev * 3 / 2 / npart / nthreads + 64;
+    let cl_out_cap = est_cl * 3 / 2 / npart / nthreads + 64;
     let p2: Vec<P2> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
@@ -1844,8 +2017,8 @@ fn main() {
                 let next = &next;
                 s.spawn(move || {
                     let mut r = P2 {
-                        ev: PartBuf::new(NPART, ev_out_cap),
-                        cl: PartBuf::new(NPART, cl_out_cap),
+                        ev: PartBuf::new(npart, ev_out_cap),
+                        cl: PartBuf::new(npart, cl_out_cap),
                     };
                     // dedup table: (key, ingest, idx)
                     let mut table: Vec<(u64, u32, u32)> = Vec::new();
@@ -1855,7 +2028,7 @@ fn main() {
                         if i >= total_items {
                             break;
                         }
-                        if i < NPART {
+                        if i < npart {
                             let p = i;
                             let n: usize = p1.iter().map(|t| t.ev.len(p)).sum();
                             if n == 0 {
@@ -1916,7 +2089,7 @@ fn main() {
                                         Some(pi) => persons.people[pi as usize],
                                         None => (e.uid_h, e.uid),
                                     };
-                                    r.ev.push(part_of(name_h), EvB {
+                                    r.ev.push(part_of(name_h, pshift), EvB {
                                         name_h,
                                         name,
                                         ts: e.ts,
@@ -1925,7 +2098,7 @@ fn main() {
                                 }
                             }
                         } else {
-                            let (t, a, b) = cl_items[i - NPART];
+                            let (t, a, b) = cl_items[i - npart];
                             let v = &p1[t].cl[a..b];
                             let pm = &persons.map;
                             for (k, c) in v.iter().enumerate() {
@@ -1936,7 +2109,7 @@ fn main() {
                                     Some(pi) => persons.people[pi as usize].0,
                                     None => c.uid_h,
                                 };
-                                r.cl.push(part_of(name_h), ClB {
+                                r.cl.push(part_of(name_h, pshift), ClB {
                                     name_h,
                                     cid: c.cid,
                                     ts: c.ts,
@@ -1968,7 +2141,7 @@ fn main() {
                     let mut clp: Vec<&[ClB]> = Vec::with_capacity(p2.len());
                     loop {
                         let q = next.fetch_add(1, Ordering::Relaxed);
-                        if q >= NPART {
+                        if q >= npart {
                             break;
                         }
                         evp.clear();
