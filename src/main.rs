@@ -236,7 +236,7 @@ fn pin_thread(t: usize) {
             Some(c) => c,
             None => return,
         };
-        if cpus.len() < 2 || std::env::var_os("SS_NOPIN").is_some() {
+        if cpus.len() < 2 || std::env::var_os("SS_PIN").is_none() {
             return;
         }
         unsafe {
