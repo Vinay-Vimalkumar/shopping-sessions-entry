@@ -1,5 +1,6 @@
 # Shopping Sessions engine: one static Rust binary on an empty base image.
-FROM rust:1-slim-bookworm AS build
+# Pinned by digest (rustc 1.100.0) so the final rebuild uses the exact toolchain we validated.
+FROM rust:1-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
