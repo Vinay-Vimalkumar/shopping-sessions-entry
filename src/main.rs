@@ -762,10 +762,12 @@ unsafe fn scan_fields_px<const N: usize, F: FnMut(&[&'static [u8]; N])>(
                 continue;
             }
             let ee = nl.trailing_zeros();
-            let below: u128 = (1u128 << ee) - 1;
             e = ee as usize;
-            cm = ((c0 as u128) | ((c1 as u128) << 64)) & below;
-            qm = ((q0 as u128) | ((q1 as u128) << 64)) & below;
+            // keep the bits below the newline (bzhi leaves the word whole for an index >= 64)
+            use std::arch::x86_64::_bzhi_u64;
+            let hi = ee.saturating_sub(64);
+            cm = (_bzhi_u64(c0, ee) as u128) | ((_bzhi_u64(c1, hi) as u128) << 64);
+            qm = (_bzhi_u64(q0, ee) as u128) | ((_bzhi_u64(q1, hi) as u128) << 64);
         } else if n0 != 0 {
             let ee = n0.trailing_zeros();
             let below = (1u64 << ee) - 1;
@@ -803,50 +805,54 @@ unsafe fn scan_fields_px<const N: usize, F: FnMut(&[&'static [u8]; N])>(
         let chi = (cm >> 64) as u64;
         let plo = clo.count_ones();
         if (plo + chi.count_ones()) as usize == N - 1 && (clo & 1) == 0 && e > 0 {
-            use std::arch::x86_64::{_pdep_u64, _pext_u64};
+            use std::arch::x86_64::_pext_u64;
             let base = data.as_ptr().add(s);
-            let mut pos = [0usize; 8];
+            // comma offsets: the first N-1 set bits of the low word, then those of the high word
+            // written from slot plo on (surplus slots hold junk that is overwritten or unused)
+            let mut pos = [0usize; 16];
+            let mut m = clo;
             for k in 0..N - 1 {
-                let kk = k as u32;
-                let c = if kk < plo {
-                    _pdep_u64(1u64 << kk, clo).trailing_zeros() as usize
-                } else {
-                    64 + _pdep_u64(1u64 << (kk - plo), chi).trailing_zeros() as usize
-                };
-                *pos.get_unchecked_mut(k) = c;
+                *pos.get_unchecked_mut(k) = m.trailing_zeros() as usize;
+                m &= m.wrapping_sub(1);
+            }
+            let mut m = chi;
+            let pl = plo as usize;
+            let quick = if N - 1 < 3 { N - 1 } else { 3 };
+            for k in 0..quick {
+                *pos.get_unchecked_mut(pl + k) = 64 + m.trailing_zeros() as usize;
+                m &= m.wrapping_sub(1);
+            }
+            if m != 0 {
+                for k in quick..N - 1 {
+                    *pos.get_unchecked_mut(pl + k) = 64 + m.trailing_zeros() as usize;
+                    m &= m.wrapping_sub(1);
+                }
             }
             *pos.get_unchecked_mut(N - 1) = e;
+            // Quotes, one path for every line. In comma order: field k+1 opens with a quote iff a
+            // quote follows comma k, field k closes with one iff a quote precedes comma k; the first
+            // field's opening and the last field's closing quote are read directly. The line is
+            // well formed iff every field opens and closes alike, each quoted field holds both of
+            // its quotes (length >= 2), and the line has no other quote (count == 2 per quoted field).
+            let qlo = qm as u64;
+            let qhi = (qm >> 64) as u64;
+            let opens = _pext_u64((qlo >> 1) | (qhi << 63), clo) | (_pext_u64(qhi >> 1, chi) << plo);
+            let closes = _pext_u64(qlo << 1, clo) | (_pext_u64((qhi << 1) | (qlo >> 63), chi) << plo);
+            let last = (*p.add(e - 1) == b'"') as u64;
+            let fq = (opens << 1) | (qlo & 1);
             let mut fl: [&'static [u8]; N] = [&[]; N];
-            if qm == 0 {
-                let mut st = 0usize;
-                for k in 0..N {
-                    let en = *pos.get_unchecked(k);
-                    *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st), en - st);
-                    st = en + 1;
-                }
+            let mut st = 0usize;
+            let mut neg = 0usize;
+            for k in 0..N {
+                let en = *pos.get_unchecked(k);
+                let o = ((fq >> k) & 1) as usize;
+                let n = (en - st).wrapping_sub(2 * o);
+                neg |= n;
+                *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st + o), n);
+                st = en + 1;
+            }
+            if fq == (closes | (last << (N - 1))) && (neg as isize) >= 0 && qlo.count_ones() + qhi.count_ones() == 2 * fq.count_ones() {
                 f(&fl);
-            } else {
-                let starts: u128 = (cm << 1) | 1;
-                let ends: u128 = (cm >> 1) | (1u128 << (e - 1));
-                let qs = qm & starts;
-                let qe = qm & ends;
-                let pext128 = |x: u128, m: u128| -> u64 {
-                    let ml = m as u64;
-                    _pext_u64(x as u64, ml) | (_pext_u64((x >> 64) as u64, (m >> 64) as u64) << ml.count_ones())
-                };
-                if qm == (qs | qe) && (qs & qe) == 0 {
-                    let fq = pext128(qs, starts);
-                    if fq == pext128(qe, ends) {
-                        let mut st = 0usize;
-                        for k in 0..N {
-                            let en = *pos.get_unchecked(k);
-                            let o = ((fq >> k) & 1) as usize;
-                            *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st + o), en - st - 2 * o);
-                            st = en + 1;
-                        }
-                        f(&fl);
-                    }
-                }
             }
         }
         s += e + 1;
@@ -1047,11 +1053,15 @@ struct DateTab {
     day0: [i64; 8],
     dim: [u32; 8],
     n: usize,
+    // the same months, direct-mapped by month number mod 16 (empty slot: pre 0, dim 0)
+    pre16: [u64; 16],
+    day16: [i64; 16], // epoch day of the 1st, minus 1
+    dim16: [u32; 16],
 }
 
 impl DateTab {
     fn new(lo_ms: i64, hi_ms: i64) -> Self {
-        let mut t = DateTab { pre: [0; 8], day0: [0; 8], dim: [0; 8], n: 0 };
+        let mut t = DateTab { pre: [0; 8], day0: [0; 8], dim: [0; 8], n: 0, pre16: [0; 16], day16: [0; 16], dim16: [0; 16] };
         let civil = |days: i64| -> (i64, u32, u32) {
             // inverse of days_from_civil
             let z = days + 719468;
@@ -1076,6 +1086,12 @@ impl DateTab {
                     t.pre[t.n] = p;
                     t.day0[t.n] = days_from_civil(y, m, 1);
                     t.dim[t.n] = days_in_month(y, m);
+                    let k = (m & 15) as usize;
+                    if t.dim16[k] == 0 {
+                        t.pre16[k] = p;
+                        t.day16[k] = t.day0[t.n] - 1;
+                        t.dim16[k] = t.dim[t.n];
+                    }
                     t.n += 1;
                 }
             }
@@ -1103,11 +1119,74 @@ impl DateTab {
     }
 }
 
+// ---- lean F1 kernel for the common case. It reports ok only for a field it has fully validated;
+// everything else (other forms, dates outside the table, any bad value) goes to the exact parsers.
+/// "HH:MM:SS" as a LE word -> (valid, seconds of day)
+#[inline(always)]
+fn hms_k(w: u64) -> (bool, i64) {
+    const M1: u64 = 0xF0F0_FFF0_F0FF_F0F0; // digit high nibbles and the two separators
+    const V1: u64 = 0x3030_3A30_303A_3030;
+    const HM: u64 = 0xF0F0_00F0_F000_F0F0;
+    const EX: u64 = 0x3030_0030_3000_3030;
+    let fmt = ((w & M1) == V1) & ((w.wrapping_add(0x0606_0006_0600_0606) & HM) == EX);
+    let d = w & 0x0F0F_000F_0F00_0F0F;
+    // bytes 0, 3, 6 = HH, MM, SS
+    let u = d.wrapping_mul(10).wrapping_add(d >> 8) & 0x00FF_0000_FF00_00FF;
+    // HH <= 23, MM <= 59, SS <= 59: adding (127 - limit) must not reach bit 7
+    let rng = (u.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080) == 0;
+    // HH*3600 + MM*60 + SS lands in bits 48..72 of the 128-bit product
+    const K: u128 = (3600u128 << 48) + (60u128 << 24) + 1;
+    let secs = (((u as u128) * K) >> 48) as u64 & 0xFF_FFFF;
+    (fmt & rng, secs as i64)
+}
+
+/// 8 ASCII digits as a LE word (first digit most significant) -> (valid, value)
+#[inline(always)]
+fn digits8_k(w: u64) -> (bool, u64) {
+    const H: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let ok = ((w & H) == Z) & (((w.wrapping_add(0x0606_0606_0606_0606)) & H) == Z);
+    let mut v = w.wrapping_sub(Z);
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32;
+    (ok, v)
+}
+
+impl DateTab {
+    /// "YYYY-MM-" word + the two day characters -> (valid and in table, epoch day).
+    /// One probe: slot = month number mod 16 (taken from the raw characters), then the whole
+    /// 8-byte prefix is compared, so a wrong or garbage slot can only miss.
+    #[inline(always)]
+    fn day_k(&self, w0: u64, c0: u8, c1: u8) -> (bool, i64) {
+        let k = ((((w0 >> 40) & 0xFF) * 10 + ((w0 >> 48) & 0xFF)) & 15) as usize;
+        let d0 = c0.wrapping_sub(b'0') as u32;
+        let d1 = c1.wrapping_sub(b'0') as u32;
+        let dd = d0 * 10 + d1;
+        let ok = (self.pre16[k] == w0) & (d0 < 10) & (d1 < 10) & (dd.wrapping_sub(1) < self.dim16[k]);
+        (ok, self.day16[k] + dd as i64)
+    }
+}
+
+/// Strict F1 in a 20-byte field -> (handled, epoch seconds).
+#[inline(always)]
+fn f1_kernel(b: &[u8], tab: &DateTab) -> (bool, i64) {
+    debug_assert!(b.len() == 20);
+    let (dok, day) = tab.day_k(ld8(b, 0), b[8], b[9]);
+    let (hok, secs) = hms_k(ld8(b, 11));
+    (dok & hok & (b[10] == b'T') & (b[19] == b'Z'), day * 86400 + secs)
+}
+
 /// F1/F2/F3 -> epoch ms, exact.
 #[inline(always)]
 fn parse_ts_fast(b: &[u8], tab: &DateTab) -> Option<i64> {
     let n = b.len();
     if n == 20 {
+        let (ok, v) = f1_kernel(b, tab);
+        if ok {
+            return Some(v * 1000);
+        }
         if b[19] == b'Z' && b[10] == b'T' {
             return match tab.day(b) {
                 Some(Some(day)) => Some((day * 86400 + hms(b, 11)?) * 1000),
@@ -1118,8 +1197,11 @@ fn parse_ts_fast(b: &[u8], tab: &DateTab) -> Option<i64> {
         return parse_ts(b);
     }
     if n == 13 {
-        if let (Some(a), Some(c)) = (digits8(ld8(b, 0)), digits8(ld8(b, 5))) {
-            return Some((a * 100_000 + c % 100_000) as i64);
+        // the first 8 digits, then the last 5 (bytes 5..8 are validated by the first word)
+        let (aok, a) = digits8_k(ld8(b, 0));
+        let (cok, c) = digits8_k((ld8(b, 5) & !0xFF_FFFF) | 0x30_3030);
+        if aok & cok {
+            return Some((a * 100_000 + c) as i64);
         }
         return parse_ts(b);
     }
@@ -1148,7 +1230,14 @@ fn parse_ts_fast(b: &[u8], tab: &DateTab) -> Option<i64> {
 /// ingest_ts (strict F1) -> epoch seconds, exact.
 #[inline(always)]
 fn parse_f1_fast(b: &[u8], tab: &DateTab) -> Option<i64> {
-    if b.len() != 20 || b[19] != b'Z' || b[10] != b'T' {
+    if b.len() != 20 {
+        return None;
+    }
+    let (ok, v) = f1_kernel(b, tab);
+    if ok {
+        return Some(v);
+    }
+    if b[19] != b'Z' || b[10] != b'T' {
         return None;
     }
     match tab.day(b) {
