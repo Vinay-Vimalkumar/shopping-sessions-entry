@@ -361,8 +361,12 @@ unsafe fn scan_fields<const N: usize, F: FnMut(&[&'static [u8]; N])>(
         }
     }
     let mut pad: [u8; 128];
+    let pf = PF_DIST.load(Ordering::Relaxed);
     while s < end && s < len {
         let avail = len - s;
+        if pf != 0 && avail > pf + 64 {
+            prefetch(data.as_ptr().add(s + pf));
+        }
         let p: *const u8 = if avail >= 128 {
             data.as_ptr().add(s)
         } else {
@@ -448,6 +452,127 @@ unsafe fn scan_fields<const N: usize, F: FnMut(&[&'static [u8]; N])>(
                 }
                 if bad == 0 && expect == q {
                     f(&fl);
+                }
+            }
+        }
+        s += e + 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt")]
+unsafe fn scan_fields_px<const N: usize, F: FnMut(&[&'static [u8]; N])>(
+    data: &'static [u8],
+    start: usize,
+    end: usize,
+    f: &mut F,
+) {
+    let len = data.len();
+    let mut s = start;
+    if s > 0 && *data.get_unchecked(s - 1) != b'\n' {
+        match memchr::memchr(b'\n', &data[s..]) {
+            Some(i) => s += i + 1,
+            None => return,
+        }
+    }
+    let mut pad: [u8; 128];
+    let pf = PF_DIST.load(Ordering::Relaxed);
+    while s < end && s < len {
+        let avail = len - s;
+        if pf != 0 && avail > pf + 64 {
+            prefetch(data.as_ptr().add(s + pf));
+        }
+        let p: *const u8 = if avail >= 128 {
+            data.as_ptr().add(s)
+        } else {
+            pad = [0u8; 128];
+            pad[..avail].copy_from_slice(&data[s..]);
+            pad.as_ptr()
+        };
+        let (n0, c0, q0) = masks64(p);
+        let e: usize;
+        let cm: u128;
+        let qm: u128;
+        if n0 != 0 {
+            let ee = n0.trailing_zeros();
+            let below = (1u64 << ee) - 1;
+            e = ee as usize;
+            cm = (c0 & below) as u128;
+            qm = (q0 & below) as u128;
+        } else {
+            let (n1, c1, q1) = masks64(p.add(64));
+            if n1 != 0 {
+                let ee = n1.trailing_zeros();
+                let below = (1u64 << ee) - 1;
+                e = 64 + ee as usize;
+                cm = (c0 as u128) | (((c1 & below) as u128) << 64);
+                qm = (q0 as u128) | (((q1 & below) as u128) << 64);
+            } else if avail < 128 {
+                // final line of the file, no trailing newline
+                e = avail;
+                cm = (c0 as u128) | ((c1 as u128) << 64);
+                qm = (q0 as u128) | ((q1 as u128) << 64);
+            } else {
+                // long line: exact scalar path
+                let le = match memchr::memchr(b'\n', &data[s..]) {
+                    Some(i) => s + i,
+                    None => len,
+                };
+                let mut fl: [&'static [u8]; N] = [&[]; N];
+                if split_fields(&data[s..le], &mut fl) {
+                    f(&fl);
+                }
+                s = le + 1;
+                continue;
+            }
+        }
+        let clo = cm as u64;
+        let chi = (cm >> 64) as u64;
+        let plo = clo.count_ones();
+        if (plo + chi.count_ones()) as usize == N - 1 && (clo & 1) == 0 && e > 0 {
+            use std::arch::x86_64::{_pdep_u64, _pext_u64};
+            let base = data.as_ptr().add(s);
+            let mut pos = [0usize; 8];
+            for k in 0..N - 1 {
+                let kk = k as u32;
+                let c = if kk < plo {
+                    _pdep_u64(1u64 << kk, clo).trailing_zeros() as usize
+                } else {
+                    64 + _pdep_u64(1u64 << (kk - plo), chi).trailing_zeros() as usize
+                };
+                *pos.get_unchecked_mut(k) = c;
+            }
+            *pos.get_unchecked_mut(N - 1) = e;
+            let mut fl: [&'static [u8]; N] = [&[]; N];
+            if qm == 0 {
+                let mut st = 0usize;
+                for k in 0..N {
+                    let en = *pos.get_unchecked(k);
+                    *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st), en - st);
+                    st = en + 1;
+                }
+                f(&fl);
+            } else {
+                let starts: u128 = (cm << 1) | 1;
+                let ends: u128 = (cm >> 1) | (1u128 << (e - 1));
+                let qs = qm & starts;
+                let qe = qm & ends;
+                let pext128 = |x: u128, m: u128| -> u64 {
+                    let ml = m as u64;
+                    _pext_u64(x as u64, ml) | (_pext_u64((x >> 64) as u64, (m >> 64) as u64) << ml.count_ones())
+                };
+                if qm == (qs | qe) && (qs & qe) == 0 {
+                    let fq = pext128(qs, starts);
+                    if fq == pext128(qe, ends) {
+                        let mut st = 0usize;
+                        for k in 0..N {
+                            let en = *pos.get_unchecked(k);
+                            let o = ((fq >> k) & 1) as usize;
+                            *fl.get_unchecked_mut(k) = std::slice::from_raw_parts(base.add(st + o), en - st - 2 * o);
+                            st = en + 1;
+                        }
+                        f(&fl);
+                    }
                 }
             }
         }
@@ -929,6 +1054,7 @@ impl StrMap {
 // ---------------------------------------------------------------- input files
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
 // debug accumulators (ns, summed over threads)
 static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 #[inline(always)]
@@ -2183,6 +2309,9 @@ fn main() {
     let mut lchunks = Vec::new();
     make_chunks(Kind::Link, &ln_files, 256 << 10, &mut lchunks);
     log(&format!("setup done: {} chunks, {} threads, ndays {}", chunks.len(), nthreads, ndays));
+    if let Some(d) = std::env::var("SS_PF").ok().and_then(|v| v.parse().ok()) {
+        PF_DIST.store(d, Ordering::Relaxed);
+    }
     if std::env::var_os("SS_PROF").is_some() {
         PROF.store(true, Ordering::Relaxed);
     }
@@ -2211,7 +2340,11 @@ fn main() {
                     }
                     event_fields(f, &cx, &mut st, &ut);
                 };
-                scan_fields::<7, _>(c.data, c.start, c.end, &mut cb);
+                if std::env::var_os("SS_PX").is_some() {
+                    scan_fields_px::<7, _>(c.data, c.start, c.end, &mut cb);
+                } else {
+                    scan_fields::<7, _>(c.data, c.start, c.end, &mut cb);
+                }
             }
         }
         st.flush(&ut);
@@ -2260,7 +2393,7 @@ fn main() {
     let ldone = AtomicUsize::new(0);
     let ledges: Mutex<Vec<(usize, Vec<(u32, u32)>)>> = Mutex::new(Vec::new());
     #[cfg(target_arch = "x86_64")]
-    let use_simd = std::env::var_os("SS_NOSIMD").is_none() && is_x86_feature_detected!("avx2");
+    let use_simd = std::env::var_os("SS_NOSIMD").is_none() && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_simd = false;
     struct P1 {
@@ -2294,7 +2427,7 @@ fn main() {
                             #[cfg(target_arch = "x86_64")]
                             unsafe {
                                 let mut cb = |f: &[&'static [u8]; 2]| link_fields(f, &mut v);
-                                scan_fields::<2, _>(data, c.start, c.end, &mut cb);
+                                scan_fields_px::<2, _>(data, c.start, c.end, &mut cb);
                             }
                         } else {
                             for_lines(data, c.start, c.end, |l| {
@@ -2333,11 +2466,11 @@ fn main() {
                                 match c.kind {
                                     Kind::Event => {
                                         let mut cb = |f: &[&'static [u8]; 7]| event_fields(f, cx, &mut st, ut);
-                                        scan_fields::<7, _>(data, c.start, c.end, &mut cb);
+                                        scan_fields_px::<7, _>(data, c.start, c.end, &mut cb);
                                     }
                                     Kind::Click => {
                                         let mut cb = |f: &[&'static [u8]; 4]| click_fields(f, cx, &mut st, ut);
-                                        scan_fields::<4, _>(data, c.start, c.end, &mut cb);
+                                        scan_fields_px::<4, _>(data, c.start, c.end, &mut cb);
                                     }
                                     Kind::Link => {}
                                 }
