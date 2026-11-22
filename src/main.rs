@@ -2187,10 +2187,8 @@ struct Sess {
 }
 
 struct Worker {
-    // campaign stats export: [camp * ndays + day] -> sessions, purchasing, revenue, assisted
-    // (filled by finalize_stats from the compact arrays below)
-    stats: Vec<[u64; 4]>,
-    // compact, cache-friendly accumulators over event-window days only
+    // compact, cache-friendly campaign accumulators over event-window days only (added to the
+    // shared export table by finalize_stats)
     cstat: Vec<CStat>,
     casg: Vec<u32>,
     nd: usize,
@@ -2226,7 +2224,6 @@ struct Worker {
 impl Worker {
     fn new(ncamp: usize, ndays: usize, ncat: usize) -> Self {
         Worker {
-            stats: vec![[0; 4]; (ncamp + 1) * ndays],
             cstat: Vec::new(),
             casg: Vec::new(),
             nd: 0,
@@ -2266,8 +2263,9 @@ impl Worker {
         self.casg = vec![0; (ncamp + 1) * nd];
     }
 
-    /// Fold the compact accumulators into the export layout used by the writer.
-    fn finalize_stats(&mut self) {
+    /// Add the compact accumulators to the export table used by the writer:
+    /// [camp * ndays + day] -> sessions, purchasing, revenue, assisted.
+    fn finalize_stats(&self, stats: &mut [[u64; 4]]) {
         let nd = self.nd;
         let ncamp1 = self.cstat.len() / nd.max(1);
         for c in 0..ncamp1 {
@@ -2275,7 +2273,7 @@ impl Worker {
                 let cs = self.cstat[c * nd + d];
                 let a = self.casg[c * nd + d];
                 if cs.sessions != 0 || a != 0 {
-                    let st = &mut self.stats[c * self.ndays + d + self.dshift as usize];
+                    let st = &mut stats[c * self.ndays + d + self.dshift as usize];
                     st[0] += cs.sessions as u64;
                     st[1] += cs.purchasing as u64;
                     st[2] += cs.revenue;
@@ -3544,6 +3542,8 @@ fn main() {
     order.sort_unstable_by(|a, b| psize[*b].cmp(&psize[*a]));
     let next = AtomicUsize::new(0);
     let cl_hi = cx.cl_hi;
+    // campaign stats of all workers; each adds its own when its partitions are done
+    let stats_all: Mutex<Vec<[u64; 4]>> = Mutex::new(vec![[0u64; 4]; (ncamp + 1) * ndays]);
     // each worker writes its own user_daily file as soon as its partitions are done, so the
     // writing overlaps the other workers' tail of phase 3
     let ud = out_dir.join("user_daily");
@@ -3558,6 +3558,7 @@ fn main() {
                 let ut = &ut;
                 let order = &order;
                 let ud = &ud;
+                let stats_all = &stats_all;
                 let cats = &cats;
                 s.spawn(move || {
                     pin_thread(t);
@@ -3583,7 +3584,6 @@ fn main() {
                         let qsize = 1usize << shift2;
                         w.partition(&evp, &clp, qbase, qsize, base, base_day_off, organic, ut);
                     }
-                    w.finalize_stats();
                     let rows = &w.rows;
                     let nrows = rows.day.len();
                     if nrows != 0 || t == 0 {
@@ -3606,15 +3606,13 @@ fn main() {
                         }
                         file.write_all(&own[at..]).expect("write user_daily");
                     }
+                    w.finalize_stats(&mut stats_all.lock().unwrap());
                     w
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    par_drop(p2);
-    // only now: phase-2 output chunks live inside the phase-1 buffers
-    par_drop(p1);
     log("phase 3 sessions done");
     log(&format!(
         "cpu ms: dedup-filter {:.0}, dedup-emit {:.0}, dedup-exact {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (cells {:.0}, attrib {:.0})",
@@ -3629,15 +3627,19 @@ fn main() {
     ));
 
     // ---------------- phase 4: write campaign_daily (user_daily was written by the phase 3 workers)
-    let mut stats = vec![[0u64; 4]; (ncamp + 1) * ndays];
-    for w in &workers {
-        for (a, b) in stats.iter_mut().zip(w.stats.iter()) {
-            a[0] += b[0];
-            a[1] += b[1];
-            a[2] += b[2];
-            a[3] += b[3];
-        }
-    }
+    // The big buffers are released on helper threads meanwhile.
+    let stats = stats_all.into_inner().unwrap();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            par_drop(p2);
+            // only now: phase-2 output chunks live inside the phase-1 buffers
+            par_drop(p1);
+            log("phase 1/2 buffers released");
+        });
+        s.spawn(move || {
+            par_drop(workers);
+            log("workers released");
+        });
     {
         // (campaign_id, channel, day, [sessions, purchasing, revenue, assisted])
         let mut crows: Vec<(&[u8], &[u8], i32, [u64; 4])> = Vec::new();
@@ -3667,7 +3669,7 @@ fn main() {
         fs::write(cd.join("part-000.parquet"), f.finish()).expect("write campaign_daily");
     }
     log("phase 4 write done");
-    par_drop(workers);
+    });
     log("released");
     fast_exit(nthreads);
 }
