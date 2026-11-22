@@ -38,12 +38,10 @@ mod halloc {
     unsafe impl GlobalAlloc for HugeAlloc {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             if big(l.size(), l.align()) {
-                // map 2 MB extra and trim, so the block starts on a 2 MB boundary and every
-                // 2 MB of it can be a transparent huge page
                 let sz = round(l.size());
                 let p = libc::mmap(
                     std::ptr::null_mut(),
-                    sz + HP,
+                    sz,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                     -1,
@@ -52,17 +50,8 @@ mod halloc {
                 if p == libc::MAP_FAILED {
                     return std::ptr::null_mut();
                 }
-                let a = (p as usize + HP - 1) & !(HP - 1);
-                let head = a - p as usize;
-                if head != 0 {
-                    libc::munmap(p, head);
-                }
-                let tail = HP - head;
-                if tail != 0 {
-                    libc::munmap((a + sz) as *mut libc::c_void, tail);
-                }
-                libc::madvise(a as *mut libc::c_void, sz, libc::MADV_HUGEPAGE);
-                a as *mut u8
+                libc::madvise(p, sz, libc::MADV_HUGEPAGE);
+                p as *mut u8
             } else {
                 System.alloc(l)
             }
