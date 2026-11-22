@@ -2507,7 +2507,8 @@ fn main() {
     let est_cl = cl_bytes / 52 + 1024;
     let cl_cap = est_cl * 13 / 10 / nthreads + 1024;
     // distinct user IDs are ~8% of event rows; size for ~2.5x that (load stays < 0.45)
-    let est_users = (est_ev + est_cl) / 12 + ln_bytes / 16 + 4096;
+    // link IDs are almost all event/click users too, so they add little
+    let est_users = (est_ev + est_cl) / 12 + ln_bytes / 64 + 4096;
     let cap_slots = est_users.next_power_of_two().max(1 << 16);
     // User indices are dense. Size the per-user arrays from a hard upper bound on distinct IDs
     // (a valid row is at least ~24 bytes and names at most two IDs), so they can never overflow;
