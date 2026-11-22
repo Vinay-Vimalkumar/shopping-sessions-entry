@@ -2213,9 +2213,9 @@ struct Worker {
     ev_sorted: Vec<u64>,
     cl_sorted: Vec<ClC>,
     cl_pidx: Vec<u32>,
-    cl_a: Vec<u64>, // click radix scratch: ts key << 32 | position in the chunk list
-    cl_b: Vec<u64>,
+    cl_a: Vec<u32>, // click radix scratch: positions in the chunk list, in key order
     rhist: Vec<u32>,
+    cl_hi: u32, // exclusive bound of click ts
     // 30-minute cells (sessions can only break between non-empty cells)
     cells: Vec<Cell>,
     cbits: Vec<u64>,
@@ -2249,8 +2249,8 @@ impl Worker {
             cl_sorted: Vec::new(),
             cl_pidx: Vec::new(),
             cl_a: Vec::new(),
-            cl_b: Vec::new(),
             rhist: Vec::new(),
+            cl_hi: u32::MAX,
             cells: Vec::new(),
             cbits: Vec::new(),
             purch: Vec::new(),
@@ -2331,6 +2331,30 @@ impl Worker {
         // walk cells in time order
         let row0 = self.rows.day.len();
         let nm = sget(name);
+        // Row storage is reserved once per person and written through raw pointers. A day row
+        // needs a session start on that day, and the cells span cells.len() / 48 + 2 days at most.
+        let max_rows = evs.len().min(self.cells.len() / 48 + 2);
+        let nstep = 4 + nm.len();
+        // length prefix + name, copied per row as one fixed 64-byte block when it fits
+        let mut nbuf = [0u8; 64];
+        let nfast = nm.len() <= 60;
+        if nfast {
+            nbuf[..4].copy_from_slice(&(nm.len() as u32).to_le_bytes());
+            nbuf[4..nstep].copy_from_slice(nm);
+        }
+        self.rows.name.reserve(max_rows * nstep + 64);
+        self.rows.day.reserve(max_rows);
+        self.rows.sessions.reserve(max_rows);
+        self.rows.events.reserve(max_rows);
+        self.rows.revenue.reserve(max_rows);
+        self.rows.top.reserve(max_rows);
+        let p_name = unsafe { self.rows.name.as_mut_ptr().add(self.rows.name.len()) };
+        let p_day = unsafe { self.rows.day.as_mut_ptr().add(row0) };
+        let p_sessions = unsafe { self.rows.sessions.as_mut_ptr().add(row0) };
+        let p_events = unsafe { self.rows.events.as_mut_ptr().add(row0) };
+        let p_revenue = unsafe { self.rows.revenue.as_mut_ptr().add(row0) };
+        let p_top = unsafe { self.rows.top.as_mut_ptr().add(row0) };
+        let mut nr = 0usize; // rows written
         let org = organic * self.nd;
         let mut k = 0usize; // sessions so far
         let mut prev_max: u32 = 0;
@@ -2343,13 +2367,24 @@ impl Worker {
         let mut r_purch = 0u32;
         macro_rules! flush_run {
             () => {
-                self.rows.name.extend_from_slice(&(nm.len() as u32).to_le_bytes());
-                self.rows.name.extend_from_slice(nm);
-                self.rows.day.push((base_day_off + day as i64) as i32);
-                self.rows.sessions.push((k - r_first) as i32);
-                self.rows.events.push(r_events as i32);
-                self.rows.revenue.push(r_rev as i64);
-                self.rows.top.push(u32::MAX);
+                debug_assert!(nr < max_rows);
+                // SAFETY: nr < max_rows rows were reserved above (the name column with 64
+                // bytes of slack for the fixed-size copy)
+                unsafe {
+                    let d = p_name.add(nr * nstep);
+                    if nfast {
+                        std::ptr::copy_nonoverlapping(nbuf.as_ptr(), d, 64);
+                    } else {
+                        std::ptr::copy_nonoverlapping((nm.len() as u32).to_le_bytes().as_ptr(), d, 4);
+                        std::ptr::copy_nonoverlapping(nm.as_ptr(), d.add(4), nm.len());
+                    }
+                    *p_day.add(nr) = (base_day_off + day as i64) as i32;
+                    *p_sessions.add(nr) = (k - r_first) as i32;
+                    *p_events.add(nr) = r_events as i32;
+                    *p_revenue.add(nr) = r_rev as i64;
+                    *p_top.add(nr) = u32::MAX;
+                }
+                nr += 1;
                 if direct {
                     let st = unsafe { self.cstat.get_unchecked_mut(org + (day - self.dshift) as usize) };
                     st.sessions += (k - r_first) as u32;
@@ -2419,6 +2454,16 @@ impl Worker {
             r_rev += s_rev;
             r_purch += (s_rev > 0) as u32;
             flush_run!();
+        }
+        // SAFETY: nr rows were initialised above, within the reserved capacity
+        unsafe {
+            let nl = self.rows.name.len();
+            self.rows.name.set_len(nl + nr * nstep);
+            self.rows.day.set_len(row0 + nr);
+            self.rows.sessions.set_len(row0 + nr);
+            self.rows.events.set_len(row0 + nr);
+            self.rows.revenue.set_len(row0 + nr);
+            self.rows.top.set_len(row0 + nr);
         }
         self.sess_n = k;
         // purchases -> top category of the session's day
@@ -2500,7 +2545,13 @@ impl Worker {
         // counting sort of events by person
         self.pcount.clear();
         self.pcount.resize(qsize, 0);
-        for s in evp {
+        for s in evp.iter().take(PF_AHEAD) {
+            prefetch_slice(s);
+        }
+        for (i, s) in evp.iter().enumerate() {
+            if let Some(nx) = evp.get(i + PF_AHEAD) {
+                prefetch_slice(nx);
+            }
             for e in s.iter() {
                 unsafe { *self.pcount.get_unchecked_mut((e.person - qbase) as usize) += 1 };
             }
@@ -2534,11 +2585,32 @@ impl Worker {
         let radix = ncl >= CL_RADIX_MIN && ((clp.len() as u64) << jbits) <= u32::MAX as u64;
         self.pcl.clear();
         self.pcl.resize(qsize, 0);
-        let mut ts_max = 0u32;
-        for s in clp {
-            for c in s.iter() {
-                unsafe { *self.pcl.get_unchecked_mut((c.person - qbase) as usize) += 1 };
-                ts_max = ts_max.max(c.ts);
+        // radix key: the top CL_RBITS bits of ts (every click ts is below cl_hi)
+        let sh = (32 - self.cl_hi.leading_zeros()).saturating_sub(CL_RBITS);
+        if radix {
+            // one pass: per-person counts and the key histogram
+            self.rhist.clear();
+            self.rhist.resize(1 << CL_RBITS, 0);
+            let h = self.rhist.as_mut_ptr();
+            for s in clp.iter().take(PF_AHEAD) {
+                prefetch_slice(s);
+            }
+            for (i, s) in clp.iter().enumerate() {
+                if let Some(nx) = clp.get(i + PF_AHEAD) {
+                    prefetch_slice(nx);
+                }
+                for c in s.iter() {
+                    unsafe {
+                        *self.pcl.get_unchecked_mut((c.person - qbase) as usize) += 1;
+                        *h.add((c.ts >> sh) as usize) += 1;
+                    }
+                }
+            }
+        } else {
+            for s in clp {
+                for c in s.iter() {
+                    unsafe { *self.pcl.get_unchecked_mut((c.person - qbase) as usize) += 1 };
+                }
             }
         }
         self.cl_pidx.clear();
@@ -2553,70 +2625,39 @@ impl Worker {
         self.cl_sorted.clear();
         self.cl_sorted.resize(acc as usize, ClC { cid: 0, ts: 0, camp: 0 });
         if radix {
-            // Stable LSD radix sort of the partition's clicks on the top 16 bits of ts (two
-            // 8-bit digits), then the stable scatter by person: each person's clicks come out
-            // ordered by ts up to the dropped low bits and click_id ties, which fix_clicks repairs.
-            // The radix passes move 8-byte (key, position) pairs; the records themselves are
-            // gathered once, by the scatter by person.
-            const RB: usize = 8;
-            const RM: u32 = (1 << RB) - 1;
-            let sh = (32 - ts_max.leading_zeros()).saturating_sub(2 * RB as u32);
-            self.rhist.clear();
-            self.rhist.resize(2 << RB, 0);
-            // every slot of both buffers is written below (the cursors are exact prefix sums)
+            // One stable counting pass over the partition's clicks on the top bits of ts, then
+            // the stable scatter by person: each person's clicks come out ordered by ts up to
+            // the dropped low bits, which fix_clicks repairs. The counting pass moves 4-byte
+            // positions; the records themselves are gathered once, by the scatter by person.
+            // every slot of the buffer is written below (the cursors are exact prefix sums)
             self.cl_a.clear();
             self.cl_a.reserve(ncl);
-            self.cl_b.clear();
-            self.cl_b.reserve(ncl);
-            unsafe {
-                self.cl_a.set_len(ncl);
-                self.cl_b.set_len(ncl);
+            unsafe { self.cl_a.set_len(ncl) };
+            let mut acc = 0u32;
+            for c in self.rhist.iter_mut() {
+                let n = *c;
+                *c = acc;
+                acc += n;
             }
-            let (h0, h1) = self.rhist.split_at_mut(1 << RB);
-            for s in clp {
-                for c in s.iter() {
-                    let k = c.ts >> sh;
-                    unsafe {
-                        *h0.get_unchecked_mut((k & RM) as usize) += 1;
-                        *h1.get_unchecked_mut((k >> RB) as usize) += 1;
-                    }
-                }
-            }
-            for h in [&mut *h0, &mut *h1] {
-                let mut acc = 0u32;
-                for c in h.iter_mut() {
-                    let n = *c;
-                    *c = acc;
-                    acc += n;
-                }
-            }
+            let h = self.rhist.as_mut_ptr();
             for (ci, s) in clp.iter().enumerate() {
-                let pos0 = (ci as u64) << jbits;
+                let pos0 = (ci as u32) << jbits;
                 for (j, c) in s.iter().enumerate() {
-                    let k = c.ts >> sh;
                     unsafe {
-                        let d = h0.get_unchecked_mut((k & RM) as usize);
-                        *self.cl_a.get_unchecked_mut(*d as usize) = ((k as u64) << 32) | pos0 | j as u64;
+                        let d = h.add((c.ts >> sh) as usize);
+                        *self.cl_a.get_unchecked_mut(*d as usize) = pos0 | j as u32;
                         *d += 1;
                     }
                 }
             }
-            for &x in self.cl_a.iter() {
-                unsafe {
-                    let d = h1.get_unchecked_mut((x >> (32 + RB)) as usize);
-                    *self.cl_b.get_unchecked_mut(*d as usize) = x;
-                    *d += 1;
-                }
-            }
             let jmask = (1u32 << jbits) - 1;
-            let at = |x: u64| unsafe {
-                let pos = x as u32;
+            let at = |pos: u32| unsafe {
                 clp.get_unchecked((pos >> jbits) as usize).as_ptr().add((pos & jmask) as usize)
             };
-            for (i, &x) in self.cl_b.iter().enumerate() {
+            for (i, &x) in self.cl_a.iter().enumerate() {
                 unsafe {
                     if i + 8 < ncl {
-                        prefetch(at(*self.cl_b.get_unchecked(i + 8)));
+                        prefetch(at(*self.cl_a.get_unchecked(i + 8)));
                     }
                     let c = &*at(x);
                     let d = self.pcl.get_unchecked_mut((c.person - qbase) as usize);
@@ -2791,6 +2832,24 @@ impl Worker {
         }
     }
 }
+
+/// The phase-2 output chunks are small and scattered, and were written past the cache: the
+/// first pass over a partition fetches each chunk this many chunks ahead of its use.
+const PF_AHEAD: usize = 4;
+
+#[inline(always)]
+fn prefetch_slice<T>(s: &[T]) {
+    let p = s.as_ptr() as *const u8;
+    let n = std::mem::size_of_val(s);
+    let mut o = 0;
+    while o < n {
+        prefetch(p.wrapping_add(o));
+        o += 64;
+    }
+}
+
+/// Bits of the click radix key.
+const CL_RBITS: u32 = 11;
 
 /// Partitions with at least this many clicks sort them by radix (see Worker::partition).
 const CL_RADIX_MIN: usize = 512;
@@ -3484,6 +3543,7 @@ fn main() {
     let psize: Vec<usize> = (0..npart2).map(|q| p2.iter().map(|t| t.ev.len(q)).sum()).collect();
     order.sort_unstable_by(|a, b| psize[*b].cmp(&psize[*a]));
     let next = AtomicUsize::new(0);
+    let cl_hi = cx.cl_hi;
     // each worker writes its own user_daily file as soon as its partitions are done, so the
     // writing overlaps the other workers' tail of phase 3
     let ud = out_dir.join("user_daily");
@@ -3504,6 +3564,7 @@ fn main() {
                     let mut w = Worker::new(ncamp, ndays, ncat);
                     w.ensure_cells(ncells);
                     w.set_window(ncamp, win_dshift, win_nd);
+                    w.cl_hi = cl_hi;
                     let mut evp: Vec<&[EvB]> = Vec::with_capacity(p2.len() * 2);
                     let mut clp: Vec<&[ClB]> = Vec::with_capacity(p2.len() * 2);
                     loop {
