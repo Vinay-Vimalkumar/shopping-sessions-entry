@@ -914,6 +914,14 @@ impl StrMap {
 
 // ---------------------------------------------------------------- input files
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static X_NOPUSH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static X_ACC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// debug accumulators (ns, summed over threads)
+static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[inline(always)]
+fn tadd(i: usize, t: Instant) {
+    TACC[i].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
 
 
 /// Unmap inputs and release memory on all threads, then leave without the serial teardown.
@@ -1167,6 +1175,10 @@ fn event_fields(f: &[&'static [u8]; 7], cx: &Ctx, out: &mut PartBuf<EvA>) {
         rec.ts = rel as u32;
         rec.meta = meta;
     }
+    if X_NOPUSH.load(Ordering::Relaxed) {
+        X_ACC.fetch_add(rec.key ^ rec.uid_h ^ rec.ts as u64, Ordering::Relaxed);
+        return;
+    }
     out.push(part, rec);
 }
 
@@ -1232,8 +1244,50 @@ fn manifest_value(text: &str, key: &str) -> Option<String> {
 // ---------------------------------------------------------------- links
 /// uid hash -> person index, plus person table (name hash, name sref).
 struct Persons {
-    map: U64Map,
+    /// uid hash -> person name hash, one cache line per probe
+    lmap: Vec<(u64, u64)>,
+    lmask: usize,
+    /// bit filter over linked uid hashes (high bits): unlinked uids skip lmap
+    filt: Vec<u64>,
+    fmask: u64,
+    /// name hash -> person index (for name lookup once per person)
+    by_name: U64Map,
     people: Vec<(u64, u64)>,
+}
+
+impl Persons {
+    #[inline(always)]
+    fn fbit(&self, uid_h: u64) -> bool {
+        let b = (uid_h >> 32) & self.fmask;
+        unsafe { (*self.filt.get_unchecked((b >> 6) as usize) >> (b & 63)) & 1 != 0 }
+    }
+    #[inline(always)]
+    fn fptr(&self, uid_h: u64) -> *const u64 {
+        let b = (uid_h >> 32) & self.fmask;
+        unsafe { self.filt.as_ptr().add((b >> 6) as usize) }
+    }
+    #[inline(always)]
+    fn lptr(&self, uid_h: u64) -> *const (u64, u64) {
+        unsafe { self.lmap.as_ptr().add((uid_h as usize) & self.lmask) }
+    }
+    /// person name hash for a uid (the uid's own hash if it is in no link)
+    #[inline(always)]
+    fn name_of(&self, uid_h: u64) -> (u64, bool) {
+        if !self.fbit(uid_h) {
+            return (uid_h, false);
+        }
+        let mut i = (uid_h as usize) & self.lmask;
+        loop {
+            let s = unsafe { *self.lmap.get_unchecked(i) };
+            if s.0 == uid_h {
+                return (s.1, true);
+            }
+            if s.0 == 0 {
+                return (uid_h, false);
+            }
+            i = (i + 1) & self.lmask;
+        }
+    }
 }
 
 /// A parsed link line: both side hashes and string refs.
@@ -1335,12 +1389,30 @@ fn build_persons(recs: &[Vec<LinkRec>]) -> Persons {
         }
         node_person.push(person_of_root[r]);
     }
-    for s in map.slots.iter_mut() {
+    let nk = map.len.max(1);
+    let lcap = (nk * 2).next_power_of_two().max(16);
+    let lmask = lcap - 1;
+    let mut lmap: Vec<(u64, u64)> = vec![(0, 0); lcap];
+    let fbits = (nk * 16).next_power_of_two().clamp(1 << 16, 1 << 26) as u64;
+    let fmask = fbits - 1;
+    let mut filt: Vec<u64> = vec![0; (fbits / 64) as usize];
+    for s in map.slots.iter() {
         if s.key != 0 {
-            s.val = node_person[s.val as usize];
+            let name_h = people[node_person[s.val as usize] as usize].0;
+            let mut i = (s.key as usize) & lmask;
+            while lmap[i].0 != 0 {
+                i = (i + 1) & lmask;
+            }
+            lmap[i] = (s.key, name_h);
+            let b = (s.key >> 32) & fmask;
+            filt[(b >> 6) as usize] |= 1u64 << (b & 63);
         }
     }
-    Persons { map, people }
+    let mut by_name = U64Map::with_capacity(people.len() + 16);
+    for (i, p) in people.iter().enumerate() {
+        by_name.get_or_insert(p.0, i as u32);
+    }
+    Persons { lmap, lmask, filt, fmask, by_name, people }
 }
 
 // ---------------------------------------------------------------- per-person processing
@@ -1380,12 +1452,22 @@ struct Worker {
     // grouping scratch
     pmap: U64Map,
     pname: Vec<u64>,
+    pnh: Vec<u64>,
     pcount: Vec<u32>,
     pcl: Vec<u32>,
     pidx: Vec<u32>,
     ev_sorted: Vec<u64>,
     cl_sorted: Vec<ClC>,
     cl_pidx: Vec<u32>,
+    // 30-minute cells (sessions can only break between non-empty cells)
+    cmin: Vec<u32>,
+    cmax: Vec<u32>,
+    ccnt: Vec<u32>,
+    crev: Vec<u64>,
+    csess: Vec<u32>,
+    cbits: Vec<u64>,
+    sess_cnt: Vec<u32>,
+    dcat: Vec<u64>, // [day * ncat + cat] purchase revenue
 }
 
 impl Worker {
@@ -1406,12 +1488,151 @@ impl Worker {
             rows: Vec::new(),
             pmap: U64Map::with_capacity(1024),
             pname: Vec::new(),
+            pnh: Vec::new(),
             pcount: Vec::new(),
             pcl: Vec::new(),
             pidx: Vec::new(),
             ev_sorted: Vec::new(),
             cl_sorted: Vec::new(),
             cl_pidx: Vec::new(),
+            cmin: Vec::new(),
+            cmax: Vec::new(),
+            ccnt: Vec::new(),
+            crev: Vec::new(),
+            csess: Vec::new(),
+            cbits: Vec::new(),
+            sess_cnt: Vec::new(),
+            dcat: vec![0; ndays * ncat],
+        }
+    }
+
+    fn ensure_cells(&mut self, ncells: usize) {
+        if self.cmin.len() < ncells {
+            self.cmin = vec![0; ncells];
+            self.cmax = vec![0; ncells];
+            self.ccnt = vec![0; ncells];
+            self.crev = vec![0; ncells];
+            self.csess = vec![0; ncells];
+            self.cbits = vec![0; (ncells + 63) / 64];
+        }
+    }
+
+    /// Sessions from unsorted events (ts << 32 | meta) via 30-minute cells; fills sess_* and runs,
+    /// and emits the user_daily rows.
+    fn sessionize_cells(&mut self, name: u64, evs: &[u64], base: i64, base_day_off: i64) {
+        self.sess_start.clear();
+        self.sess_day.clear();
+        self.sess_rev.clear();
+        self.sess_cnt.clear();
+        self.runs.clear();
+        self.run_of.clear();
+        let mut cmin_c = usize::MAX;
+        let mut cmax_c = 0usize;
+        for &e in evs {
+            let ts = (e >> 32) as u32;
+            let price = (e as u32 & 0xFF_FFFF) as u64;
+            let c = (ts / GAP_MS) as usize;
+            let w = c >> 6;
+            let b = 1u64 << (c & 63);
+            unsafe {
+                let bw = self.cbits.get_unchecked_mut(w);
+                if *bw & b == 0 {
+                    *bw |= b;
+                    *self.cmin.get_unchecked_mut(c) = ts;
+                    *self.cmax.get_unchecked_mut(c) = ts;
+                    *self.ccnt.get_unchecked_mut(c) = 1;
+                    *self.crev.get_unchecked_mut(c) = price;
+                } else {
+                    let m = self.cmin.get_unchecked_mut(c);
+                    *m = (*m).min(ts);
+                    let x = self.cmax.get_unchecked_mut(c);
+                    *x = (*x).max(ts);
+                    *self.ccnt.get_unchecked_mut(c) += 1;
+                    *self.crev.get_unchecked_mut(c) += price;
+                }
+            }
+            if c < cmin_c {
+                cmin_c = c;
+            }
+            if c > cmax_c {
+                cmax_c = c;
+            }
+        }
+        // walk cells in time order
+        let mut prev_max: u32 = 0;
+        let mut have = false;
+        for w in (cmin_c >> 6)..=(cmax_c >> 6) {
+            let mut bits = self.cbits[w];
+            self.cbits[w] = 0;
+            while bits != 0 {
+                let c = (w << 6) | bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let lo = self.cmin[c];
+                if !have || lo - prev_max > GAP_MS {
+                    have = true;
+                    let day = (((base + lo as i64).div_euclid(DAY_MS)) - base_day_off) as u32;
+                    if self.runs.last().map(|r| r.0) != Some(day) {
+                        self.runs.push((day, self.sess_start.len() as u32));
+                    }
+                    self.run_of.push((self.runs.len() - 1) as u32);
+                    self.sess_start.push(lo);
+                    self.sess_day.push(day);
+                    self.sess_rev.push(0);
+                    self.sess_cnt.push(0);
+                }
+                let k = self.sess_start.len() - 1;
+                self.sess_cnt[k] += self.ccnt[c];
+                self.sess_rev[k] += self.crev[c];
+                self.csess[c] = k as u32;
+                prev_max = self.cmax[c];
+            }
+        }
+        // purchases -> category revenue of the session's day
+        let ncat = self.ncat;
+        let mut any_purchase = false;
+        for &e in evs {
+            let meta = e as u32;
+            let price = meta & 0xFF_FFFF;
+            if price != 0 {
+                let ts = (e >> 32) as u32;
+                let k = self.csess[(ts / GAP_MS) as usize] as usize;
+                let d = self.sess_day[k] as usize;
+                self.dcat[d * ncat + (meta >> 24) as usize] += price as u64;
+                any_purchase = true;
+            }
+        }
+        // user_daily rows: one per day run
+        let nruns = self.runs.len();
+        for r in 0..nruns {
+            let (day, first) = self.runs[r];
+            let end = if r + 1 < nruns { self.runs[r + 1].1 as usize } else { self.sess_start.len() };
+            let first = first as usize;
+            let mut events = 0u32;
+            let mut revenue = 0u64;
+            for k in first..end {
+                events += self.sess_cnt[k];
+                revenue += self.sess_rev[k];
+            }
+            let mut top = u32::MAX;
+            if any_purchase && revenue > 0 {
+                let row = &mut self.dcat[day as usize * ncat..(day as usize + 1) * ncat];
+                let mut best = 0u64;
+                for (ci, v) in row.iter_mut().enumerate() {
+                    if *v > best {
+                        best = *v;
+                        top = ci as u32;
+                    }
+                    *v = 0;
+                }
+            }
+            self.rows.push(UserRow {
+                name,
+                day: (base_day_off + day as i64) as i32,
+                sessions: (end - first) as u32,
+                events,
+                revenue,
+                top,
+            });
         }
     }
 
@@ -1439,11 +1660,20 @@ impl Worker {
     }
 
     /// Process one partition of persons.
-    fn partition(&mut self, evp: &[&[EvB]], clp: &[&[ClB]], base: i64, base_day_off: i64, organic: usize) {
+    fn partition(
+        &mut self,
+        evp: &[&[EvB]],
+        clp: &[&[ClB]],
+        base: i64,
+        base_day_off: i64,
+        organic: usize,
+        persons: &Persons,
+    ) {
         let nev: usize = evp.iter().map(|s| s.len()).sum();
         if nev == 0 {
             return;
         }
+        let t_g = Instant::now();
         // local person ids
         let cap_hint = nev / 4 + 64;
         if self.pmap.slots.len() < cap_hint * 2 || self.pmap.slots.len() > cap_hint * 16 {
@@ -1455,6 +1685,7 @@ impl Worker {
             self.pmap.len = 0;
         }
         self.pname.clear();
+        self.pnh.clear();
         self.pcount.clear();
         self.pidx.clear();
         self.pidx.reserve(nev);
@@ -1463,6 +1694,7 @@ impl Worker {
                 let (p, new) = self.pmap.get_or_insert(e.name_h, self.pname.len() as u32);
                 if new {
                     self.pname.push(e.name);
+                    self.pnh.push(e.name_h);
                     self.pcount.push(0);
                 }
                 self.pcount[p as usize] += 1;
@@ -1532,24 +1764,50 @@ impl Worker {
                 self.cl_sorted[w] = ClC { cid: c.cid, ts: c.ts, camp: c.camp };
             }
         }
+        tadd(3, t_g);
+        let t_p = Instant::now();
         // per person
         let mut ev_sorted = std::mem::take(&mut self.ev_sorted);
         let mut cl_sorted = std::mem::take(&mut self.cl_sorted);
+        let t_s = Instant::now();
+        let sorted_mode = std::env::var_os("SS_SORTED").is_some();
         for p in 0..np {
-            let evs = &mut ev_sorted[starts[p] as usize..starts[p + 1] as usize];
-            sort_u64(evs);
+            if sorted_mode {
+                sort_u64(&mut ev_sorted[starts[p] as usize..starts[p + 1] as usize]);
+            }
             let cls = &mut cl_sorted[cstarts[p] as usize..cstarts[p + 1] as usize];
             if cls.len() > 1 {
                 cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
             }
-            self.person(self.pname[p], evs, cls, base, base_day_off, organic);
+        }
+        tadd(5, t_s);
+        for p in 0..np {
+            let evs = &ev_sorted[starts[p] as usize..starts[p + 1] as usize];
+            let cls = &cl_sorted[cstarts[p] as usize..cstarts[p + 1] as usize];
+            let mut name = self.pname[p];
+            if name == 0 {
+                let pi = persons.by_name.get(self.pnh[p]).expect("linked person") as usize;
+                name = persons.people[pi].1;
+            }
+            if sorted_mode {
+                self.person_sorted(name, evs, cls, base, base_day_off, organic);
+            } else {
+                self.person(name, evs, cls, base, base_day_off, organic);
+            }
         }
         self.ev_sorted = ev_sorted;
         self.cl_sorted = cl_sorted;
+        tadd(4, t_p);
     }
 
     /// evs: one person's events (ts << 32 | meta) sorted; cls: clicks sorted by (ts, cid).
     fn person(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
+        self.sessionize_cells(name, evs, base, base_day_off);
+        self.attribute(cls, organic);
+    }
+
+    #[allow(dead_code)]
+    fn person_sorted(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
         self.sess_start.clear();
         self.sess_day.clear();
         self.sess_rev.clear();
@@ -1605,8 +1863,10 @@ impl Worker {
             self.sess_rev.push(rev);
         }
         self.emit_row(name, cur_day, d_sess, d_events, d_rev, cat_touched, base_day_off);
+        self.attribute(cls, organic);
+    }
 
-        // attribution
+    fn attribute(&mut self, cls: &[ClC], organic: usize) {
         let s_n = self.sess_start.len();
         let nc = cls.len();
         let mut lo = 0usize;
@@ -1787,6 +2047,10 @@ fn main() {
     let npart: usize = 1 << pbits;
     let pshift = 64 - pbits;
     cx.pshift = pshift;
+    // person partitions: 4x coarser (grouping tables stay small; fewer scatter streams)
+    let pbits2: u32 = std::env::var("SS_P2BITS").ok().and_then(|v| v.parse().ok()).unwrap_or(pbits.saturating_sub(2).max(6));
+    let npart2: usize = 1 << pbits2;
+    let pshift2 = 64 - pbits2;
     let cx = cx;
     let mut chunks = Vec::new();
     make_chunks(Kind::Event, &ev_files, 2 << 20, &mut chunks);
@@ -1794,6 +2058,9 @@ fn main() {
     let mut lchunks = Vec::new();
     make_chunks(Kind::Link, &ln_files, 256 << 10, &mut lchunks);
     log(&format!("setup done: {} chunks, {} threads, ndays {}", chunks.len(), nthreads, ndays));
+    if std::env::var_os("SS_X_NOPUSH1").is_some() {
+        X_NOPUSH.store(true, Ordering::Relaxed);
+    }
     if let Ok(mode) = std::env::var("SS_BENCH") {
         // debug micro-benchmark: single thread over all event chunks
         let mut acc = 0usize;
@@ -1945,7 +2212,7 @@ fn main() {
                         let recs: Vec<Vec<LinkRec>> = all.into_iter().map(|x| x.1).collect();
                         log("links parsed");
                         let p = build_persons(&recs);
-                        log(&format!("links done: {} ids, {} persons", p.map.len, p.people.len()));
+                        log(&format!("links done: {} persons", p.people.len()));
                         let _ = persons_cell.set(p);
                     }
                     let mut r = P1 { ev: PartBuf::new(npart, per_part), cl: Vec::with_capacity(cl_cap) };
@@ -2006,8 +2273,8 @@ fn main() {
         ev: PartBuf<EvB>,
         cl: PartBuf<ClB>,
     }
-    let ev_out_cap = est_ev * 3 / 2 / npart / nthreads + 64;
-    let cl_out_cap = est_cl * 3 / 2 / npart / nthreads + 64;
+    let ev_out_cap = est_ev * 3 / 2 / npart2 / nthreads + 64;
+    let cl_out_cap = est_cl * 3 / 2 / npart2 / nthreads + 64;
     let p2: Vec<P2> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
@@ -2017,10 +2284,13 @@ fn main() {
                 let next = &next;
                 s.spawn(move || {
                     let mut r = P2 {
-                        ev: PartBuf::new(npart, ev_out_cap),
-                        cl: PartBuf::new(npart, cl_out_cap),
+                        ev: PartBuf::new(npart2, ev_out_cap),
+                        cl: PartBuf::new(npart2, cl_out_cap),
                     };
                     // dedup table: (key, ingest, idx)
+                    let exp_nolookup = std::env::var_os("SS_X_NOLOOKUP").is_some();
+                    let exp_nopush = std::env::var_os("SS_X_NOPUSH").is_some();
+                    let mut exp_acc = 0u64;
                     let mut table: Vec<(u64, u32, u32)> = Vec::new();
                     let mut loser: Vec<u64> = Vec::new();
                     loop {
@@ -2034,6 +2304,7 @@ fn main() {
                             if n == 0 {
                                 continue;
                             }
+                            let t_a = Instant::now();
                             let cap = (n + n / 2).next_power_of_two().max(16);
                             let mask = cap - 1;
                             table.clear();
@@ -2068,15 +2339,22 @@ fn main() {
                                     j += 1;
                                 }
                             }
-                            let pm = &persons.map;
+                            tadd(0, t_a);
+                            let t_b = Instant::now();
                             let mut j = 0u32;
                             for v in p1.iter().flat_map(|t| [t.ev.main(p), t.ev.over(p)]) {
                                 let m = v.len();
                                 for k in 0..m {
-                                    if k + 8 < m {
-                                        let f = v[k + 8];
+                                    if k + 16 < m {
+                                        let f = unsafe { *v.get_unchecked(k + 16) };
                                         if f.ts != u32::MAX {
-                                            prefetch(pm.slot_ptr(f.uid_h));
+                                            prefetch(persons.fptr(f.uid_h));
+                                        }
+                                    }
+                                    if k + 8 < m {
+                                        let f = unsafe { *v.get_unchecked(k + 8) };
+                                        if f.ts != u32::MAX && persons.fbit(f.uid_h) {
+                                            prefetch(persons.lptr(f.uid_h));
                                         }
                                     }
                                     let e = v[k];
@@ -2085,11 +2363,13 @@ fn main() {
                                     if e.ts == u32::MAX || (loser[(jj >> 6) as usize] >> (jj & 63)) & 1 != 0 {
                                         continue;
                                     }
-                                    let (name_h, name) = match pm.get(e.uid_h) {
-                                        Some(pi) => persons.people[pi as usize],
-                                        None => (e.uid_h, e.uid),
-                                    };
-                                    r.ev.push(part_of(name_h, pshift), EvB {
+                                    let (name_h, linked) = if exp_nolookup { (e.uid_h, false) } else { persons.name_of(e.uid_h) };
+                                    let name = if linked { 0 } else { e.uid };
+                                    if exp_nopush {
+                                        exp_acc = exp_acc.wrapping_add(name_h ^ name);
+                                        continue;
+                                    }
+                                    r.ev.push(part_of(name_h, pshift2), EvB {
                                         name_h,
                                         name,
                                         ts: e.ts,
@@ -2097,26 +2377,31 @@ fn main() {
                                     });
                                 }
                             }
+                            tadd(1, t_b);
                         } else {
+                            let t_c = Instant::now();
                             let (t, a, b) = cl_items[i - npart];
                             let v = &p1[t].cl[a..b];
-                            let pm = &persons.map;
                             for (k, c) in v.iter().enumerate() {
-                                if k + 8 < v.len() {
-                                    prefetch(pm.slot_ptr(v[k + 8].uid_h));
+                                if k + 16 < v.len() {
+                                    prefetch(persons.fptr(v[k + 16].uid_h));
                                 }
-                                let name_h = match pm.get(c.uid_h) {
-                                    Some(pi) => persons.people[pi as usize].0,
-                                    None => c.uid_h,
-                                };
-                                r.cl.push(part_of(name_h, pshift), ClB {
+                                if k + 8 < v.len() && persons.fbit(v[k + 8].uid_h) {
+                                    prefetch(persons.lptr(v[k + 8].uid_h));
+                                }
+                                let name_h = persons.name_of(c.uid_h).0;
+                                r.cl.push(part_of(name_h, pshift2), ClB {
                                     name_h,
                                     cid: c.cid,
                                     ts: c.ts,
                                     camp: c.camp,
                                 });
                             }
+                            tadd(2, t_c);
                         }
+                    }
+                    if exp_acc == 42 {
+                        eprintln!("x");
                     }
                     r
                 })
@@ -2129,21 +2414,30 @@ fn main() {
 
     // ---------------- phase 3: per person partition
     let ncat = cats.len();
+    let ncells = (cx.ev_hi / GAP_MS) as usize + 2;
+    // largest partitions first (a whale person makes one partition much bigger)
+    let mut order: Vec<usize> = (0..npart2).collect();
+    let psize: Vec<usize> = (0..npart2).map(|q| p2.iter().map(|t| t.ev.len(q)).sum()).collect();
+    order.sort_unstable_by(|a, b| psize[*b].cmp(&psize[*a]));
     let next = AtomicUsize::new(0);
     let workers: Vec<Worker> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 let p2 = &p2;
                 let next = &next;
+                let persons = &persons;
+                let order = &order;
                 s.spawn(move || {
                     let mut w = Worker::new(ncamp, ndays, ncat);
+                    w.ensure_cells(ncells);
                     let mut evp: Vec<&[EvB]> = Vec::with_capacity(p2.len());
                     let mut clp: Vec<&[ClB]> = Vec::with_capacity(p2.len());
                     loop {
-                        let q = next.fetch_add(1, Ordering::Relaxed);
-                        if q >= npart {
+                        let qi = next.fetch_add(1, Ordering::Relaxed);
+                        if qi >= npart2 {
                             break;
                         }
+                        let q = order[qi];
                         evp.clear();
                         clp.clear();
                         for t in p2.iter() {
@@ -2152,7 +2446,7 @@ fn main() {
                             clp.push(t.cl.main(q));
                             clp.push(t.cl.over(q));
                         }
-                        w.partition(&evp, &clp, base, base_day_off, organic);
+                        w.partition(&evp, &clp, base, base_day_off, organic, persons);
                     }
                     w
                 })
@@ -2162,6 +2456,15 @@ fn main() {
     });
     par_drop(p2);
     log("phase 3 sessions done");
+    log(&format!(
+        "cpu ms: dedup-table {:.0}, dedup-emit {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (sort {:.0})",
+        TACC[0].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[1].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[2].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[3].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[4].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[5].load(Ordering::Relaxed) as f64 / 1e6
+    ));
 
     // ---------------- phase 4: write
     let ud = out_dir.join("user_daily");
