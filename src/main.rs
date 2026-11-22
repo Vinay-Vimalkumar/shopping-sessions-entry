@@ -97,13 +97,15 @@ mod halloc {
 #[global_allocator]
 static GA: halloc::HugeAlloc = halloc::HugeAlloc;
 
-/// Records staged per partition before a write-combined flush.
+/// Records staged per partition before a write-combined flush (default; `W` on `PartBuf`).
+/// `W * size_of::<T>()` should be a multiple of 64 so every flush writes whole cache lines:
+/// a partly written line is evicted from the write-combining buffers by the other streams.
 const WK: usize = 8;
 
 /// Per-thread partitioned buffer: one big allocation, fixed capacity per partition, overflow Vecs.
 /// Pushes are staged WK at a time in a small cache-resident buffer and flushed as whole cache
 /// lines (non-temporal stores on Linux/AVX2 builds), so scattering does not stall on misses.
-struct PartBuf<T: Copy> {
+struct PartBuf<T: Copy, const W: usize = WK> {
     mem: Vec<T>,
     cap: usize,
     lens: Vec<u32>,
@@ -125,19 +127,19 @@ unsafe fn nt_copy(src: *const u8, dst: *mut u8, bytes: usize) {
     }
 }
 
-impl<T: Copy> PartBuf<T> {
+impl<T: Copy, const W: usize> PartBuf<T, W> {
     fn new(nparts: usize, cap: usize) -> Self {
-        let cap = (cap + WK - 1) / WK * WK;
+        let cap = (cap + W - 1) / W * W;
         let mem: Vec<T> = Vec::with_capacity(nparts * cap);
         let nt = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
-            && (mem.as_ptr() as usize) % 32 == 0
-            && (std::mem::size_of::<T>() * WK) % 32 == 0;
+            && (mem.as_ptr() as usize) % 64 == 0
+            && (std::mem::size_of::<T>() * W) % 32 == 0;
         PartBuf {
             mem,
             cap,
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| Vec::new()).collect(),
-            stage: Vec::with_capacity(nparts * WK),
+            stage: Vec::with_capacity(nparts * W),
             slen: vec![0; nparts],
             nt,
         }
@@ -146,9 +148,24 @@ impl<T: Copy> PartBuf<T> {
     fn push(&mut self, p: usize, v: T) {
         unsafe {
             let n = *self.slen.get_unchecked(p) as usize;
-            self.stage.as_mut_ptr().add(p * WK + n).write(v);
-            if n + 1 < WK {
+            self.stage.as_mut_ptr().add(p * W + n).write(v);
+            if n + 1 < W {
                 *self.slen.get_unchecked_mut(p) = (n + 1) as u32;
+            } else {
+                *self.slen.get_unchecked_mut(p) = 0;
+                self.flush_full(p);
+            }
+        }
+    }
+    /// Branch-free conditional push: the record is always staged, but only kept if `keep`.
+    #[inline(always)]
+    fn push_if(&mut self, p: usize, v: T, keep: bool) {
+        unsafe {
+            let n = *self.slen.get_unchecked(p) as usize;
+            self.stage.as_mut_ptr().add(p * W + n).write(v);
+            let n2 = n + keep as usize;
+            if n2 < W {
+                *self.slen.get_unchecked_mut(p) = n2 as u32;
             } else {
                 *self.slen.get_unchecked_mut(p) = 0;
                 self.flush_full(p);
@@ -158,22 +175,22 @@ impl<T: Copy> PartBuf<T> {
     #[inline(always)]
     unsafe fn flush_full(&mut self, p: usize) {
         let l = *self.lens.get_unchecked(p) as usize;
-        let src = self.stage.as_ptr().add(p * WK);
-        if l + WK <= self.cap {
+        let src = self.stage.as_ptr().add(p * W);
+        if l + W <= self.cap {
             let dst = self.mem.as_mut_ptr().add(p * self.cap + l);
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             {
                 if self.nt {
-                    nt_copy(src as *const u8, dst as *mut u8, WK * std::mem::size_of::<T>());
+                    nt_copy(src as *const u8, dst as *mut u8, W * std::mem::size_of::<T>());
                 } else {
-                    std::ptr::copy_nonoverlapping(src, dst, WK);
+                    std::ptr::copy_nonoverlapping(src, dst, W);
                 }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            std::ptr::copy_nonoverlapping(src, dst, WK);
-            *self.lens.get_unchecked_mut(p) = (l + WK) as u32;
+            std::ptr::copy_nonoverlapping(src, dst, W);
+            *self.lens.get_unchecked_mut(p) = (l + W) as u32;
         } else {
-            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src, WK));
+            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src, W));
         }
     }
     /// Flush staged records; must be called before reading.
@@ -185,7 +202,7 @@ impl<T: Copy> PartBuf<T> {
                     continue;
                 }
                 let l = self.lens[p] as usize;
-                let src = self.stage.as_ptr().add(p * WK);
+                let src = self.stage.as_ptr().add(p * W);
                 if l + n <= self.cap {
                     std::ptr::copy_nonoverlapping(src, self.mem.as_mut_ptr().add(p * self.cap + l), n);
                     self.lens[p] = (l + n) as u32;
@@ -2875,7 +2892,7 @@ fn main() {
     let next = AtomicUsize::new(0);
     let total_items = npart + cl_items.len();
     struct P2 {
-        ev: PartBuf<EvB>,
+        ev: PartBuf<EvB, 16>,
         cl: PartBuf<ClB>,
     }
     let ev_out_cap = est_ev * 21 / 20 / npart2 / nthreads + 32;
@@ -2890,12 +2907,19 @@ fn main() {
                 s.spawn(move || {
                     pin_thread(t);
                     let mut r = P2 { ev: PartBuf::new(npart2, ev_out_cap), cl: PartBuf::new(npart2, cl_out_cap) };
-                    // dedup table: (key, ingest, idx)
-                    // dedup table slots: (key, ingest, gen << 24 | idx); a slot is empty unless its
-                    // generation matches, so the table is never cleared between partitions
+                    // Dedup, per event-ID partition:
+                    //  1. a 2-bit "seen / seen again" counter filter over the keys; a key that has
+                    //     two or more copies always lands every copy on a "seen again" counter
+                    //  2. rows on a "seen once" counter are unique keys: emitted directly if valid;
+                    //     the rest (true repeats + filter collisions) are set aside
+                    //  3. the set-aside rows go through an exact min-ingest table (first copy wins
+                    //     ties; invalid copies take part, so a winning tombstone drops the event)
+                    let fmul: usize = std::env::var("SS_FMUL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+                    let mut filt: Vec<u64> = Vec::new();
+                    let mut cand: Vec<EvA> = Vec::new();
+                    // exact table slots: (key, ingest, (candidate index + 1) << 1 | valid); 0 = empty
                     let mut table: Vec<(u64, u32, u32)> = Vec::new();
-                    let mut gen: u32 = 0;
-                    let mut loser: Vec<u64> = Vec::new();
+                    let mut win: Vec<u32> = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= total_items {
@@ -2908,72 +2932,110 @@ fn main() {
                                 continue;
                             }
                             let t_a = Instant::now();
-                            let cap = (n + n / 2).next_power_of_two().max(16);
-                            let mask = cap - 1;
-                            assert!(n < (1 << 24), "dedup partition too large");
-                            if table.len() < cap {
-                                table = vec![(0, 0, 0); cap];
-                                gen = 0;
+                            // counters: power of two, >= fmul per row (32 per u64 word)
+                            let nctr = (n * fmul).next_power_of_two().max(64);
+                            let words = nctr / 32;
+                            let cmask = (nctr - 1) as u64;
+                            if filt.len() < words {
+                                filt = vec![0u64; words];
+                            } else {
+                                filt[..words].fill(0);
                             }
-                            gen += 1;
-                            if gen == 256 {
-                                for t in table.iter_mut() {
-                                    t.2 = 0;
-                                }
-                                gen = 1;
-                            }
-                            let g = gen << 24;
-                            loser.clear();
-                            loser.resize((n + 63) / 64, 0);
-                            let mut j = 0u32;
+                            let fp = filt.as_mut_ptr();
                             for sl in p1.iter().flat_map(|t| [t.ev.main(p), t.ev.over(p)]) {
                                 for e in sl.iter() {
+                                    let c = e.key & cmask;
+                                    unsafe {
+                                        let w = fp.add((c >> 5) as usize);
+                                        let x = *w;
+                                        let m = 1u64 << ((c & 31) * 2);
+                                        *w = x | m | ((x & m) << 1);
+                                    }
+                                }
+                            }
+                            tadd(0, t_a);
+                            let t_b = Instant::now();
+                            cand.clear();
+                            cand.reserve(n + 1);
+                            let cp = cand.as_mut_ptr();
+                            let mut nc = 0usize;
+                            let fp = filt.as_ptr();
+                            for v in p1.iter().flat_map(|t| [t.ev.main(p), t.ev.over(p)]) {
+                                let m = v.len();
+                                for k in 0..m {
+                                    if k + 16 < m {
+                                        let f = unsafe { v.get_unchecked(k + 16) };
+                                        prefetch(unsafe { parent.as_ptr().add(f.user as usize) });
+                                    }
+                                    let e = unsafe { *v.get_unchecked(k) };
+                                    let c = e.key & cmask;
+                                    let again = unsafe { *fp.add((c >> 5) as usize) } >> ((c & 31) * 2 + 1) & 1;
+                                    // branch-free: stage the row both ways, keep one (or neither)
+                                    unsafe { cp.add(nc).write(e) };
+                                    nc += again as usize;
+                                    let person = person_of(parent, e.user);
+                                    r.ev.push_if(
+                                        (person >> shift2) as usize,
+                                        EvB { person, ts: e.ts, meta: e.meta },
+                                        (again == 0) & (e.ts != u32::MAX),
+                                    );
+                                }
+                            }
+                            unsafe { cand.set_len(nc) };
+                            tadd(1, t_b);
+                            if nc != 0 {
+                                let t_x = Instant::now();
+                                assert!(nc < (1usize << 31) - 1, "dedup partition too large");
+                                let cap = (nc * 2).next_power_of_two().max(16);
+                                let mask = cap - 1;
+                                if table.len() < cap {
+                                    table = vec![(0, 0, 0); cap];
+                                } else {
+                                    table[..cap].fill((0, 0, 0));
+                                }
+                                for (j, e) in cand.iter().enumerate() {
                                     let key = e.key;
                                     let ing = e.ingest;
-                                    let mut slot = (key as usize) & mask;
+                                    // the low key bits chose the filter counter; use higher ones here
+                                    let mut slot = ((key >> 20) as usize) & mask;
                                     loop {
                                         let tt = unsafe { table.get_unchecked_mut(slot) };
-                                        if (tt.2 >> 24) != gen {
-                                            *tt = (key, ing, g | j);
+                                        let tag = ((j as u32 + 1) << 1) | (e.ts != u32::MAX) as u32;
+                                        if tt.2 == 0 {
+                                            *tt = (key, ing, tag);
                                             break;
                                         }
                                         if tt.0 == key {
                                             if ing < tt.1 {
-                                                let old = tt.2 & 0xFF_FFFF;
-                                                loser[(old >> 6) as usize] |= 1u64 << (old & 63);
                                                 tt.1 = ing;
-                                                tt.2 = g | j;
-                                            } else {
-                                                loser[(j >> 6) as usize] |= 1u64 << (j & 63);
+                                                tt.2 = tag;
                                             }
                                             break;
                                         }
                                         slot = (slot + 1) & mask;
                                     }
-                                    j += 1;
                                 }
-                            }
-                            tadd(0, t_a);
-                            let t_b = Instant::now();
-                            let mut j = 0u32;
-                            for v in p1.iter().flat_map(|t| [t.ev.main(p), t.ev.over(p)]) {
-                                let m = v.len();
-                                for k in 0..m {
-                                    if k + 16 < m {
-                                        let f = unsafe { *v.get_unchecked(k + 16) };
+                                // winners that are valid rows, compacted branch-free
+                                win.clear();
+                                win.reserve(cap + 1);
+                                let wp = win.as_mut_ptr();
+                                let mut nw = 0usize;
+                                for tt in table[..cap].iter() {
+                                    unsafe { wp.add(nw).write((tt.2 >> 1).wrapping_sub(1)) };
+                                    nw += (tt.2 & 1) as usize;
+                                }
+                                unsafe { win.set_len(nw) };
+                                for k in 0..nw {
+                                    if k + 8 < nw {
+                                        let f = unsafe { cand.get_unchecked(*win.get_unchecked(k + 8) as usize) };
                                         prefetch(unsafe { parent.as_ptr().add(f.user as usize) });
                                     }
-                                    let e = unsafe { *v.get_unchecked(k) };
-                                    let jj = j;
-                                    j += 1;
-                                    if e.ts == u32::MAX || (loser[(jj >> 6) as usize] >> (jj & 63)) & 1 != 0 {
-                                        continue;
-                                    }
+                                    let e = unsafe { cand.get_unchecked(*win.get_unchecked(k) as usize) };
                                     let person = person_of(parent, e.user);
                                     r.ev.push((person >> shift2) as usize, EvB { person, ts: e.ts, meta: e.meta });
                                 }
+                                tadd(7, t_x);
                             }
-                            tadd(1, t_b);
                         } else {
                             let t_c = Instant::now();
                             let (t, a, b) = cl_items[i - npart];
@@ -3087,9 +3149,10 @@ fn main() {
     par_drop(p2);
     log("phase 3 sessions done");
     log(&format!(
-        "cpu ms: dedup-table {:.0}, dedup-emit {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (cells {:.0}, attrib {:.0})",
+        "cpu ms: dedup-filter {:.0}, dedup-emit {:.0}, dedup-exact {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (cells {:.0}, attrib {:.0})",
         TACC[0].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[1].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[7].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[2].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[3].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[4].load(Ordering::Relaxed) as f64 / 1e6,
