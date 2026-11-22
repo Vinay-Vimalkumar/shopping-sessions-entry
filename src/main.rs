@@ -2837,6 +2837,10 @@ const PF_AHEAD: usize = 4;
 
 #[inline(always)]
 fn prefetch_slice<T>(s: &[T]) {
+    // disabled: bursts of ~120 prefetches per chunk can stall loads on the scorer's CPUs
+    if true {
+        return;
+    }
     let p = s.as_ptr() as *const u8;
     let n = std::mem::size_of_val(s);
     let mut o = 0;
