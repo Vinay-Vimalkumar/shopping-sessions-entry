@@ -2142,8 +2142,8 @@ struct Worker {
     ev_sorted: Vec<u64>,
     cl_sorted: Vec<ClC>,
     cl_pidx: Vec<u32>,
-    cl_a: Vec<ClB>, // click radix scratch
-    cl_b: Vec<ClB>,
+    cl_a: Vec<u64>, // click radix scratch: ts key << 32 | position in the chunk list
+    cl_b: Vec<u64>,
     rhist: Vec<u32>,
     // 30-minute cells (sessions can only break between non-empty cells)
     cells: Vec<Cell>,
@@ -2457,7 +2457,10 @@ impl Worker {
         }
         // clicks by person
         let ncl: usize = clp.iter().map(|s| s.len()).sum();
-        let radix = ncl >= CL_RADIX_MIN;
+        // a click's position in the chunk list as one u32: chunk << jbits | index in the chunk
+        let jmax = clp.iter().map(|s| s.len()).max().unwrap_or(0);
+        let jbits = usize::BITS - jmax.leading_zeros();
+        let radix = ncl >= CL_RADIX_MIN && ((clp.len() as u64) << jbits) <= u32::MAX as u64;
         self.pcl.clear();
         self.pcl.resize(qsize, 0);
         let mut ts_max = 0u32;
@@ -2482,6 +2485,8 @@ impl Worker {
             // Stable LSD radix sort of the partition's clicks on the top 16 bits of ts (two
             // 8-bit digits), then the stable scatter by person: each person's clicks come out
             // ordered by ts up to the dropped low bits and click_id ties, which fix_clicks repairs.
+            // The radix passes move 8-byte (key, position) pairs; the records themselves are
+            // gathered once, by the scatter by person.
             const RB: usize = 8;
             const RM: u32 = (1 << RB) - 1;
             let sh = (32 - ts_max.leading_zeros()).saturating_sub(2 * RB as u32);
@@ -2514,24 +2519,35 @@ impl Worker {
                     acc += n;
                 }
             }
-            for s in clp {
-                for c in s.iter() {
+            for (ci, s) in clp.iter().enumerate() {
+                let pos0 = (ci as u64) << jbits;
+                for (j, c) in s.iter().enumerate() {
+                    let k = c.ts >> sh;
                     unsafe {
-                        let d = h0.get_unchecked_mut(((c.ts >> sh) & RM) as usize);
-                        *self.cl_a.get_unchecked_mut(*d as usize) = *c;
+                        let d = h0.get_unchecked_mut((k & RM) as usize);
+                        *self.cl_a.get_unchecked_mut(*d as usize) = ((k as u64) << 32) | pos0 | j as u64;
                         *d += 1;
                     }
                 }
             }
-            for c in self.cl_a.iter() {
+            for &x in self.cl_a.iter() {
                 unsafe {
-                    let d = h1.get_unchecked_mut((c.ts >> sh >> RB) as usize);
-                    *self.cl_b.get_unchecked_mut(*d as usize) = *c;
+                    let d = h1.get_unchecked_mut((x >> (32 + RB)) as usize);
+                    *self.cl_b.get_unchecked_mut(*d as usize) = x;
                     *d += 1;
                 }
             }
-            for c in self.cl_b.iter() {
+            let jmask = (1u32 << jbits) - 1;
+            let at = |x: u64| unsafe {
+                let pos = x as u32;
+                clp.get_unchecked((pos >> jbits) as usize).as_ptr().add((pos & jmask) as usize)
+            };
+            for (i, &x) in self.cl_b.iter().enumerate() {
                 unsafe {
+                    if i + 8 < ncl {
+                        prefetch(at(*self.cl_b.get_unchecked(i + 8)));
+                    }
+                    let c = &*at(x);
                     let d = self.pcl.get_unchecked_mut((c.person - qbase) as usize);
                     *self.cl_sorted.get_unchecked_mut(*d as usize) = ClC { cid: c.cid, ts: c.ts, camp: c.camp };
                     *d += 1;
