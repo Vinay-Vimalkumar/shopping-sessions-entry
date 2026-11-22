@@ -603,7 +603,28 @@ unsafe fn scan_fields_px<const N: usize, F: FnMut(&[&'static [u8]; N])>(
         let e: usize;
         let cm: u128;
         let qm: u128;
-        if n0 != 0 {
+        if N >= 7 && avail >= 128 && !SCAN_BRANCHY.load(Ordering::Relaxed) {
+            // event lines straddle the 64-byte mark unpredictably: take both windows, no branch
+            let (n1, c1, q1) = masks64(p.add(64));
+            let nl = (n0 as u128) | ((n1 as u128) << 64);
+            if nl == 0 {
+                let le = match memchr::memchr(b'\n', &data[s..]) {
+                    Some(i) => s + i,
+                    None => len,
+                };
+                let mut fl: [&'static [u8]; N] = [&[]; N];
+                if split_fields(&data[s..le], &mut fl) {
+                    f(&fl);
+                }
+                s = le + 1;
+                continue;
+            }
+            let ee = nl.trailing_zeros();
+            let below: u128 = (1u128 << ee) - 1;
+            e = ee as usize;
+            cm = ((c0 as u128) | ((c1 as u128) << 64)) & below;
+            qm = ((q0 as u128) | ((q1 as u128) << 64)) & below;
+        } else if n0 != 0 {
             let ee = n0.trailing_zeros();
             let below = (1u64 << ee) - 1;
             e = ee as usize;
@@ -1165,6 +1186,7 @@ impl StrMap {
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PF_DIST: AtomicUsize = AtomicUsize::new(0);
+static SCAN_BRANCHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // debug accumulators (ns, summed over threads)
 static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 #[inline(always)]
@@ -2471,6 +2493,9 @@ fn main() {
     log(&format!("setup done: {} chunks, {} threads, ndays {}", chunks.len(), nthreads, ndays));
     if let Some(d) = std::env::var("SS_PF").ok().and_then(|v| v.parse().ok()) {
         PF_DIST.store(d, Ordering::Relaxed);
+    }
+    if std::env::var_os("SS_BRANCHY").is_some() {
+        SCAN_BRANCHY.store(true, Ordering::Relaxed);
     }
     if std::env::var_os("SS_PROF").is_some() {
         PROF.store(true, Ordering::Relaxed);
