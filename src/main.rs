@@ -2607,7 +2607,10 @@ fn main() {
                 s.spawn(move || {
                     let mut r = P2 { ev: PartBuf::new(npart2, ev_out_cap), cl: PartBuf::new(npart2, cl_out_cap) };
                     // dedup table: (key, ingest, idx)
+                    // dedup table slots: (key, ingest, gen << 24 | idx); a slot is empty unless its
+                    // generation matches, so the table is never cleared between partitions
                     let mut table: Vec<(u64, u32, u32)> = Vec::new();
+                    let mut gen: u32 = 0;
                     let mut loser: Vec<u64> = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -2623,8 +2626,19 @@ fn main() {
                             let t_a = Instant::now();
                             let cap = (n + n / 2).next_power_of_two().max(16);
                             let mask = cap - 1;
-                            table.clear();
-                            table.resize(cap, (0, 0, u32::MAX));
+                            assert!(n < (1 << 24), "dedup partition too large");
+                            if table.len() < cap {
+                                table = vec![(0, 0, 0); cap];
+                                gen = 0;
+                            }
+                            gen += 1;
+                            if gen == 256 {
+                                for t in table.iter_mut() {
+                                    t.2 = 0;
+                                }
+                                gen = 1;
+                            }
+                            let g = gen << 24;
                             loser.clear();
                             loser.resize((n + 63) / 64, 0);
                             let mut j = 0u32;
@@ -2635,16 +2649,16 @@ fn main() {
                                     let mut slot = (key as usize) & mask;
                                     loop {
                                         let tt = unsafe { table.get_unchecked_mut(slot) };
-                                        if tt.2 == u32::MAX {
-                                            *tt = (key, ing, j);
+                                        if (tt.2 >> 24) != gen {
+                                            *tt = (key, ing, g | j);
                                             break;
                                         }
                                         if tt.0 == key {
                                             if ing < tt.1 {
-                                                let old = tt.2;
+                                                let old = tt.2 & 0xFF_FFFF;
                                                 loser[(old >> 6) as usize] |= 1u64 << (old & 63);
                                                 tt.1 = ing;
-                                                tt.2 = j;
+                                                tt.2 = g | j;
                                             } else {
                                                 loser[(j >> 6) as usize] |= 1u64 << (j & 63);
                                             }
