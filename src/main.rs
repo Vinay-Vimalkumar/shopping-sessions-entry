@@ -2875,63 +2875,42 @@ fn main() {
                 if rows.is_empty() && wi != 0 {
                     return;
                 }
-                let names: Vec<&[u8]> = rows.iter().map(|r| sget(r.name)).collect();
-                let days: Vec<i32> = rows.iter().map(|r| r.day).collect();
-                let sess: Vec<i64> = rows.iter().map(|r| r.sessions as i64).collect();
-                let evn: Vec<i64> = rows.iter().map(|r| r.events as i64).collect();
-                let rev: Vec<i64> = rows.iter().map(|r| r.revenue as i64).collect();
-                let top: Vec<Option<&[u8]>> =
-                    rows.iter().map(|r| if r.top == u32::MAX { None } else { Some(cats[r.top as usize]) }).collect();
-                let cols = [
-                    pq::Column { name: "user_id", data: pq::Data::Str(&names) },
-                    pq::Column { name: "day", data: pq::Data::Date(&days) },
-                    pq::Column { name: "sessions", data: pq::Data::I64(&sess) },
-                    pq::Column { name: "events", data: pq::Data::I64(&evn) },
-                    pq::Column { name: "revenue_cents", data: pq::Data::I64(&rev) },
-                    pq::Column { name: "top_category", data: pq::Data::OptStr(&top) },
-                ];
-                let bytes = pq::write_file(&cols, rows.len());
-                fs::write(ud.join(format!("part-{wi:03}.parquet")), bytes).expect("write user_daily");
+                let mut f = pq::Writer::new(rows.len(), rows.len() * 48 + 1024);
+                f.str_col("user_id", rows.iter().map(|r| sget(r.name)));
+                f.date_col("day", rows.iter().map(|r| r.day));
+                f.i32_col("sessions", rows.iter().map(|r| r.sessions as i32));
+                f.i32_col("events", rows.iter().map(|r| r.events as i32));
+                f.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
+                f.dict_col("top_category", cats, rows.iter().map(|r| r.top));
+                fs::write(ud.join(format!("part-{wi:03}.parquet")), f.finish()).expect("write user_daily");
             });
         }
-        let mut c_id: Vec<&[u8]> = Vec::new();
-        let mut c_ch: Vec<&[u8]> = Vec::new();
-        let mut c_day: Vec<i32> = Vec::new();
-        let mut c_s: Vec<i64> = Vec::new();
-        let mut c_p: Vec<i64> = Vec::new();
-        let mut c_r: Vec<i64> = Vec::new();
-        let mut c_a: Vec<i64> = Vec::new();
+        // (campaign_id, channel, day, [sessions, purchasing, revenue, assisted])
+        let mut crows: Vec<(&[u8], &[u8], i32, [u64; 4])> = Vec::new();
         for c in 0..=ncamp {
             for d in 0..ndays {
-                let st = stats[c * ndays + d];
+                let mut st = stats[c * ndays + d];
                 if st[0] == 0 && st[3] == 0 {
                     continue;
                 }
+                let day = (base_day_off + d as i64) as i32;
                 if c == organic {
-                    c_id.push(b"organic");
-                    c_ch.push(b"organic");
+                    st[3] = 0;
+                    crows.push((b"organic", b"organic", day, st));
                 } else {
-                    c_id.push(camp_ids[c]);
-                    c_ch.push(camp_ch[c]);
+                    crows.push((camp_ids[c], camp_ch[c], day, st));
                 }
-                c_day.push((base_day_off + d as i64) as i32);
-                c_s.push(st[0] as i64);
-                c_p.push(st[1] as i64);
-                c_r.push(st[2] as i64);
-                c_a.push(if c == organic { 0 } else { st[3] as i64 });
             }
         }
-        let cols = [
-            pq::Column { name: "campaign_id", data: pq::Data::Str(&c_id) },
-            pq::Column { name: "channel", data: pq::Data::Str(&c_ch) },
-            pq::Column { name: "day", data: pq::Data::Date(&c_day) },
-            pq::Column { name: "sessions", data: pq::Data::I64(&c_s) },
-            pq::Column { name: "purchasing_sessions", data: pq::Data::I64(&c_p) },
-            pq::Column { name: "revenue_cents", data: pq::Data::I64(&c_r) },
-            pq::Column { name: "assisted_sessions", data: pq::Data::I64(&c_a) },
-        ];
-        let bytes = pq::write_file(&cols, c_id.len());
-        fs::write(cd.join("part-000.parquet"), bytes).expect("write campaign_daily");
+        let mut f = pq::Writer::new(crows.len(), crows.len() * 64 + 1024);
+        f.str_col("campaign_id", crows.iter().map(|r| r.0));
+        f.str_col("channel", crows.iter().map(|r| r.1));
+        f.date_col("day", crows.iter().map(|r| r.2));
+        f.i32_col("sessions", crows.iter().map(|r| r.3[0] as i32));
+        f.i32_col("purchasing_sessions", crows.iter().map(|r| r.3[1] as i32));
+        f.i64_col("revenue_cents", crows.iter().map(|r| r.3[2] as i64));
+        f.i32_col("assisted_sessions", crows.iter().map(|r| r.3[3] as i32));
+        fs::write(cd.join("part-000.parquet"), f.finish()).expect("write campaign_daily");
     });
     log("phase 4 write done");
     par_drop(workers);

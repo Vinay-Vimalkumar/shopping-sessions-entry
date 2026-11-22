@@ -1,18 +1,8 @@
-//! Minimal Parquet writer: one row group per file, one PLAIN data page (v1) per
-//! column, no compression. Supports required BYTE_ARRAY (UTF8), optional
-//! BYTE_ARRAY (UTF8), INT32 (DATE) and INT64 columns.
-
-pub enum Data<'a> {
-    Str(&'a [&'a [u8]]),
-    OptStr(&'a [Option<&'a [u8]>]),
-    Date(&'a [i32]),
-    I64(&'a [i64]),
-}
-
-pub struct Column<'a> {
-    pub name: &'static str,
-    pub data: Data<'a>,
-}
+//! Minimal Parquet writer: one row group per file, one data page (v1) per column,
+//! no compression. Pages are encoded straight from caller-supplied iterators into
+//! the file buffer (no intermediate column vectors). Supports required BYTE_ARRAY
+//! (UTF8, PLAIN), INT32 (plain or DATE), INT64, and optional dictionary-encoded
+//! BYTE_ARRAY (UTF8, RLE_DICTIONARY with a PLAIN dictionary page).
 
 // Thrift compact protocol type ids
 const T_I32: u8 = 5;
@@ -100,156 +90,283 @@ impl<'b> Thrift<'b> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Str,
+    DictStr,
+    Date,
+    I32,
+    I64,
+}
+
 struct ChunkMeta {
-    ptype: i32,
-    num_values: i64,
+    name: &'static str,
+    kind: Kind,
     size: i64,
+    /// start of the column chunk (dictionary page if any, else the data page)
     offset: i64,
-    optional: bool,
+    /// start of the data page
+    data_offset: i64,
 }
 
-fn encode_page(col: &Column, rows: usize, page: &mut Vec<u8>) {
-    page.clear();
-    match &col.data {
-        Data::Str(v) => {
-            for s in v.iter() {
-                page.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                page.extend_from_slice(s);
-            }
-        }
-        Data::OptStr(v) => {
-            // definition levels: 4-byte length, then RLE/bit-packed hybrid, bit width 1
-            let groups = (rows + 7) / 8;
-            let mut lv = Vec::with_capacity(groups + 10);
-            varint(&mut lv, ((groups as u64) << 1) | 1);
-            for g in 0..groups {
-                let mut b = 0u8;
-                for k in 0..8 {
-                    let i = g * 8 + k;
-                    if i < rows && v[i].is_some() {
-                        b |= 1 << k;
-                    }
-                }
-                lv.push(b);
-            }
-            page.extend_from_slice(&(lv.len() as u32).to_le_bytes());
-            page.extend_from_slice(&lv);
-            for s in v.iter().flatten() {
-                page.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                page.extend_from_slice(s);
-            }
-        }
-        Data::Date(v) => {
-            for x in v.iter() {
-                page.extend_from_slice(&x.to_le_bytes());
-            }
-        }
-        Data::I64(v) => {
-            for x in v.iter() {
-                page.extend_from_slice(&x.to_le_bytes());
-            }
-        }
+pub struct Writer {
+    out: Vec<u8>,
+    rows: usize,
+    metas: Vec<ChunkMeta>,
+}
+
+impl Writer {
+    /// `rows` is the row count of every column; `cap` a capacity hint in bytes.
+    pub fn new(rows: usize, cap: usize) -> Self {
+        let mut out: Vec<u8> = Vec::with_capacity(cap.max(1 << 10));
+        out.extend_from_slice(b"PAR1");
+        Writer { out, rows, metas: Vec::new() }
     }
-}
 
-/// Serialize a complete Parquet file with the given columns (all the same length).
-pub fn write_file(cols: &[Column], rows: usize) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(1 << 16);
-    out.extend_from_slice(b"PAR1");
-    let mut metas: Vec<ChunkMeta> = Vec::new();
-    let mut page = Vec::new();
-    for col in cols {
-        encode_page(col, rows, &mut page);
-        let offset = out.len() as i64;
-        let mut hdr = Vec::with_capacity(32);
-        {
-            let mut t = Thrift::new(&mut hdr);
-            t.i32(1, 0); // DATA_PAGE
-            t.i32(2, page.len() as i32);
-            t.i32(3, page.len() as i32);
-            t.struct_begin(5);
-            t.i32(1, rows as i32);
-            t.i32(2, 0); // PLAIN
-            t.i32(3, 3); // RLE
-            t.i32(4, 3); // RLE
-            t.struct_end();
-            t.buf.push(0); // end PageHeader
-        }
-        out.extend_from_slice(&hdr);
-        out.extend_from_slice(&page);
-        let (ptype, optional) = match col.data {
-            Data::Str(_) => (6, false),
-            Data::OptStr(_) => (6, true),
-            Data::Date(_) => (1, false),
-            Data::I64(_) => (2, false),
-        };
-        metas.push(ChunkMeta {
-            ptype,
-            num_values: rows as i64,
-            size: (hdr.len() + page.len()) as i64,
-            offset,
-            optional,
+    fn data_page_header(&mut self, page_len: usize, encoding: i32) {
+        let rows = self.rows as i32;
+        let mut t = Thrift::new(&mut self.out);
+        t.i32(1, 0); // DATA_PAGE
+        t.i32(2, page_len as i32);
+        t.i32(3, page_len as i32);
+        t.struct_begin(5);
+        t.i32(1, rows);
+        t.i32(2, encoding);
+        t.i32(3, 3); // RLE
+        t.i32(4, 3); // RLE
+        t.struct_end();
+        t.buf.push(0); // end PageHeader
+    }
+
+    fn push_meta(&mut self, name: &'static str, kind: Kind, offset: usize, data_offset: usize) {
+        self.metas.push(ChunkMeta {
+            name,
+            kind,
+            size: (self.out.len() - offset) as i64,
+            offset: offset as i64,
+            data_offset: data_offset as i64,
         });
     }
-    // FileMetaData
-    let meta_start = out.len();
+
+    /// Required UTF8 column, PLAIN.
+    pub fn str_col<'s, I>(&mut self, name: &'static str, it: I)
+    where
+        I: Iterator<Item = &'s [u8]> + Clone,
     {
-        let mut buf = Vec::new();
+        let page_len: usize = it.clone().map(|s| s.len() + 4).sum();
+        let offset = self.out.len();
+        self.out.reserve(page_len + 64);
+        self.data_page_header(page_len, 0);
+        let start = self.out.len();
+        let mut n = 0usize;
+        for s in it {
+            self.out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.out.extend_from_slice(s);
+            n += 1;
+        }
+        assert_eq!(n, self.rows);
+        assert_eq!(self.out.len() - start, page_len);
+        self.push_meta(name, Kind::Str, offset, offset);
+    }
+
+    fn i32_any<I: Iterator<Item = i32>>(&mut self, name: &'static str, kind: Kind, it: I) {
+        let page_len = self.rows * 4;
+        let offset = self.out.len();
+        self.out.reserve(page_len + 64);
+        self.data_page_header(page_len, 0);
+        let start = self.out.len();
+        self.out.resize(start + page_len, 0);
+        let mut n = 0usize;
+        for (c, v) in self.out[start..].chunks_exact_mut(4).zip(it) {
+            c.copy_from_slice(&v.to_le_bytes());
+            n += 1;
+        }
+        assert_eq!(n, self.rows);
+        self.push_meta(name, kind, offset, offset);
+    }
+
+    /// Required INT32 column with the DATE logical type (days since epoch).
+    pub fn date_col<I: Iterator<Item = i32>>(&mut self, name: &'static str, it: I) {
+        self.i32_any(name, Kind::Date, it);
+    }
+
+    /// Required INT32 column.
+    pub fn i32_col<I: Iterator<Item = i32>>(&mut self, name: &'static str, it: I) {
+        self.i32_any(name, Kind::I32, it);
+    }
+
+    /// Required INT64 column.
+    pub fn i64_col<I: Iterator<Item = i64>>(&mut self, name: &'static str, it: I) {
+        let page_len = self.rows * 8;
+        let offset = self.out.len();
+        self.out.reserve(page_len + 64);
+        self.data_page_header(page_len, 0);
+        let start = self.out.len();
+        self.out.resize(start + page_len, 0);
+        let mut n = 0usize;
+        for (c, v) in self.out[start..].chunks_exact_mut(8).zip(it) {
+            c.copy_from_slice(&v.to_le_bytes());
+            n += 1;
+        }
+        assert_eq!(n, self.rows);
+        self.push_meta(name, Kind::I64, offset, offset);
+    }
+
+    /// Optional UTF8 column, dictionary encoded (RLE_DICTIONARY, PLAIN dictionary
+    /// page). The iterator yields indexes into `dict`; `u32::MAX` means null.
+    pub fn dict_col<I>(&mut self, name: &'static str, dict: &[&[u8]], it: I)
+    where
+        I: Iterator<Item = u32> + Clone,
+    {
+        let rows = self.rows;
+        let offset = self.out.len();
+        // dictionary page (PLAIN)
+        let dict_len: usize = dict.iter().map(|s| s.len() + 4).sum();
         {
-            let mut t = Thrift::new(&mut buf);
+            let mut t = Thrift::new(&mut self.out);
+            t.i32(1, 2); // DICTIONARY_PAGE
+            t.i32(2, dict_len as i32);
+            t.i32(3, dict_len as i32);
+            t.struct_begin(7);
+            t.i32(1, dict.len() as i32);
+            t.i32(2, 0); // PLAIN
+            t.struct_end();
+            t.buf.push(0);
+        }
+        for s in dict {
+            self.out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.out.extend_from_slice(s);
+        }
+        // data page: definition levels (4-byte length + one bit-packed run, width 1),
+        // then the index bit width and one bit-packed run of the non-null indexes.
+        let bw = (32 - (dict.len().max(2) as u32 - 1).leading_zeros()) as usize;
+        let nn = it.clone().filter(|&v| v != u32::MAX).count();
+        let dgroups = (rows + 7) / 8;
+        let igroups = (nn + 7) / 8;
+        let mut dhdr = Vec::with_capacity(10);
+        varint(&mut dhdr, ((dgroups as u64) << 1) | 1);
+        let mut ihdr = Vec::with_capacity(11);
+        ihdr.push(bw as u8);
+        if igroups > 0 {
+            varint(&mut ihdr, ((igroups as u64) << 1) | 1);
+        }
+        let def_len = dhdr.len() + dgroups;
+        let page_len = 4 + def_len + ihdr.len() + igroups * bw;
+        let data_offset = self.out.len();
+        self.out.reserve(page_len + 64);
+        self.data_page_header(page_len, 8); // RLE_DICTIONARY
+        self.out.extend_from_slice(&(def_len as u32).to_le_bytes());
+        self.out.extend_from_slice(&dhdr);
+        let dstart = self.out.len();
+        self.out.resize(dstart + dgroups, 0);
+        self.out.extend_from_slice(&ihdr);
+        let istart = self.out.len();
+        self.out.resize(istart + igroups * bw, 0);
+        let (head, idx) = self.out.split_at_mut(istart);
+        let def = &mut head[dstart..dstart + dgroups];
+        let mut acc = 0u64;
+        let mut nbits = 0usize;
+        let mut ip = 0usize;
+        let mut n = 0usize;
+        for (i, v) in it.enumerate() {
+            n += 1;
+            if v == u32::MAX {
+                continue;
+            }
+            assert!((v as usize) < dict.len());
+            def[i >> 3] |= 1 << (i & 7);
+            acc |= (v as u64) << nbits;
+            nbits += bw;
+            while nbits >= 8 {
+                idx[ip] = acc as u8;
+                ip += 1;
+                acc >>= 8;
+                nbits -= 8;
+            }
+        }
+        if nbits > 0 {
+            idx[ip] = acc as u8;
+        }
+        assert_eq!(n, rows);
+        self.push_meta(name, Kind::DictStr, offset, data_offset);
+    }
+
+    /// Append the footer and return the complete Parquet file.
+    pub fn finish(self) -> Vec<u8> {
+        let Writer { mut out, rows, metas } = self;
+        let meta_start = out.len();
+        {
+            let mut t = Thrift::new(&mut out);
             t.i32(1, 1); // version
-            t.list_begin(2, T_STRUCT, cols.len() + 1);
+            t.list_begin(2, T_STRUCT, metas.len() + 1);
             // root
             t.elem_begin();
             t.bin(4, b"schema");
-            t.i32(5, cols.len() as i32);
+            t.i32(5, metas.len() as i32);
             t.elem_end();
-            for (col, m) in cols.iter().zip(metas.iter()) {
+            for m in metas.iter() {
+                let ptype = match m.kind {
+                    Kind::Str | Kind::DictStr => 6,
+                    Kind::Date | Kind::I32 => 1,
+                    Kind::I64 => 2,
+                };
                 t.elem_begin();
-                t.i32(1, m.ptype);
-                t.i32(3, if m.optional { 1 } else { 0 });
-                t.bin(4, col.name.as_bytes());
-                match col.data {
-                    Data::Str(_) | Data::OptStr(_) => {
+                t.i32(1, ptype);
+                t.i32(3, if m.kind == Kind::DictStr { 1 } else { 0 });
+                t.bin(4, m.name.as_bytes());
+                match m.kind {
+                    Kind::Str | Kind::DictStr => {
                         t.i32(6, 0); // converted UTF8
                         t.struct_begin(10); // logicalType
                         t.struct_begin(1); // STRING
                         t.struct_end();
                         t.struct_end();
                     }
-                    Data::Date(_) => {
+                    Kind::Date => {
                         t.i32(6, 6); // converted DATE
                         t.struct_begin(10);
                         t.struct_begin(6); // DATE
                         t.struct_end();
                         t.struct_end();
                     }
-                    Data::I64(_) => {}
+                    Kind::I32 | Kind::I64 => {}
                 }
                 t.elem_end();
             }
             t.i64(3, rows as i64);
             t.list_begin(4, T_STRUCT, 1);
             t.elem_begin(); // RowGroup
-            t.list_begin(1, T_STRUCT, cols.len());
+            t.list_begin(1, T_STRUCT, metas.len());
             let mut total = 0i64;
-            for (col, m) in cols.iter().zip(metas.iter()) {
+            for m in metas.iter() {
+                let ptype = match m.kind {
+                    Kind::Str | Kind::DictStr => 6,
+                    Kind::Date | Kind::I32 => 1,
+                    Kind::I64 => 2,
+                };
+                let dict = m.kind == Kind::DictStr;
                 total += m.size;
                 t.elem_begin(); // ColumnChunk
                 t.i64(2, m.offset);
                 t.struct_begin(3); // ColumnMetaData
-                t.i32(1, m.ptype);
-                t.list_begin(2, T_I32, 2);
+                t.i32(1, ptype);
+                t.list_begin(2, T_I32, if dict { 3 } else { 2 });
                 varint(t.buf, zz32(0)); // PLAIN
                 varint(t.buf, zz32(3)); // RLE
+                if dict {
+                    varint(t.buf, zz32(8)); // RLE_DICTIONARY
+                }
                 t.list_begin(3, T_BINARY, 1);
-                varint(t.buf, col.name.len() as u64);
-                t.buf.extend_from_slice(col.name.as_bytes());
+                varint(t.buf, m.name.len() as u64);
+                t.buf.extend_from_slice(m.name.as_bytes());
                 t.i32(4, 0); // UNCOMPRESSED
-                t.i64(5, m.num_values);
+                t.i64(5, rows as i64);
                 t.i64(6, m.size);
                 t.i64(7, m.size);
-                t.i64(9, m.offset);
+                t.i64(9, m.data_offset);
+                if dict {
+                    t.i64(11, m.offset);
+                }
                 t.struct_end();
                 t.elem_end();
             }
@@ -259,10 +376,9 @@ pub fn write_file(cols: &[Column], rows: usize) -> Vec<u8> {
             t.bin(6, b"sessions-engine");
             t.buf.push(0); // end FileMetaData
         }
-        out.extend_from_slice(&buf);
+        let meta_len = (out.len() - meta_start) as u32;
+        out.extend_from_slice(&meta_len.to_le_bytes());
+        out.extend_from_slice(b"PAR1");
+        out
     }
-    let meta_len = (out.len() - meta_start) as u32;
-    out.extend_from_slice(&meta_len.to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    out
 }
