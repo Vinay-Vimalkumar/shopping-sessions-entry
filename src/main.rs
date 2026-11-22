@@ -38,10 +38,12 @@ mod halloc {
     unsafe impl GlobalAlloc for HugeAlloc {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             if big(l.size(), l.align()) {
+                // map 2 MB extra and trim, so the block starts on a 2 MB boundary and every
+                // 2 MB of it can be a transparent huge page
                 let sz = round(l.size());
                 let p = libc::mmap(
                     std::ptr::null_mut(),
-                    sz,
+                    sz + HP,
                     libc::PROT_READ | libc::PROT_WRITE,
                     libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                     -1,
@@ -50,8 +52,17 @@ mod halloc {
                 if p == libc::MAP_FAILED {
                     return std::ptr::null_mut();
                 }
-                libc::madvise(p, sz, libc::MADV_HUGEPAGE);
-                p as *mut u8
+                let a = (p as usize + HP - 1) & !(HP - 1);
+                let head = a - p as usize;
+                if head != 0 {
+                    libc::munmap(p, head);
+                }
+                let tail = HP - head;
+                if tail != 0 {
+                    libc::munmap((a + sz) as *mut libc::c_void, tail);
+                }
+                libc::madvise(a as *mut libc::c_void, sz, libc::MADV_HUGEPAGE);
+                a as *mut u8
             } else {
                 System.alloc(l)
             }
@@ -109,7 +120,9 @@ struct PartBuf<T: Copy> {
     cap: usize,
     lens: Vec<u32>,
     over: Vec<Vec<T>>,
-    stage: Vec<T>,
+    /// staging area: WK slots per partition at mem[sbase..] (inside the same big, huge-page
+    /// backed allocation as the partitions, so the scattered stage writes stay TLB-friendly)
+    sbase: usize,
     slen: Vec<u32>,
     nt: bool,
 }
@@ -129,7 +142,7 @@ unsafe fn nt_copy(src: *const u8, dst: *mut u8, bytes: usize) {
 impl<T: Copy> PartBuf<T> {
     fn new(nparts: usize, cap: usize) -> Self {
         let cap = (cap + WK - 1) / WK * WK;
-        let mem: Vec<T> = Vec::with_capacity(nparts * cap);
+        let mem: Vec<T> = Vec::with_capacity(nparts * cap + nparts * WK);
         let nt = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
             && (mem.as_ptr() as usize) % 32 == 0
             && (std::mem::size_of::<T>() * WK) % 32 == 0;
@@ -138,7 +151,7 @@ impl<T: Copy> PartBuf<T> {
             cap,
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| Vec::new()).collect(),
-            stage: Vec::with_capacity(nparts * WK),
+            sbase: nparts * cap,
             slen: vec![0; nparts],
             nt,
         }
@@ -147,7 +160,7 @@ impl<T: Copy> PartBuf<T> {
     fn push(&mut self, p: usize, v: T) {
         unsafe {
             let n = *self.slen.get_unchecked(p) as usize;
-            self.stage.as_mut_ptr().add(p * WK + n).write(v);
+            self.mem.as_mut_ptr().add(self.sbase + p * WK + n).write(v);
             if n + 1 < WK {
                 *self.slen.get_unchecked_mut(p) = (n + 1) as u32;
             } else {
@@ -159,7 +172,7 @@ impl<T: Copy> PartBuf<T> {
     #[inline(always)]
     unsafe fn flush_full(&mut self, p: usize) {
         let l = *self.lens.get_unchecked(p) as usize;
-        let src = self.stage.as_ptr().add(p * WK);
+        let src = self.mem.as_ptr().add(self.sbase + p * WK);
         if l + WK <= self.cap {
             let dst = self.mem.as_mut_ptr().add(p * self.cap + l);
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -186,7 +199,7 @@ impl<T: Copy> PartBuf<T> {
                     continue;
                 }
                 let l = self.lens[p] as usize;
-                let src = self.stage.as_ptr().add(p * WK);
+                let src = self.mem.as_ptr().add(self.sbase + p * WK);
                 if l + n <= self.cap {
                     std::ptr::copy_nonoverlapping(src, self.mem.as_mut_ptr().add(p * self.cap + l), n);
                     self.lens[p] = (l + n) as u32;
@@ -198,7 +211,6 @@ impl<T: Copy> PartBuf<T> {
             #[cfg(target_arch = "x86_64")]
             std::arch::x86_64::_mm_sfence();
         }
-        self.stage = Vec::new();
     }
     #[inline(always)]
     fn main(&self, p: usize) -> &[T] {
@@ -3230,6 +3242,21 @@ fn main() {
     }
     let npart2 = (n_users >> shift2) + 1;
     log(&format!("phase 1 parse done ({} user slots, {} person partitions)", n_users, npart2));
+    if *LOG_ON.get().unwrap_or(&false) {
+        // arena fill per thread: rows in the fixed regions vs rows that spilled to overflow vectors
+        let fill: Vec<String> = p1
+            .iter()
+            .map(|t| {
+                let (mut m, mut o) = (0usize, 0usize);
+                for p in 0..npart {
+                    m += t.ev.main(p).len();
+                    o += t.ev.over(p).len();
+                }
+                format!("{m}+{o}")
+            })
+            .collect();
+        log(&format!("event arena fill (main+overflow) per thread: {} (cap {} each)", fill.join(" "), npart * per_part));
+    }
 
     // ---------------- phase 2: dedup events -> person partitions; clicks -> person partitions
     const CL_PIECE: usize = 1 << 16;
