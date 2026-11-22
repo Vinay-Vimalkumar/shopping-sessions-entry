@@ -27,6 +27,7 @@ dependencies = [
 name = "sessions"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "memchr",
  "memmap2",
  "xxhash-rust",
