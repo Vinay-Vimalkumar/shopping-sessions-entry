@@ -2082,7 +2082,7 @@ struct CStat {
     revenue: u64,
 }
 
-/// Click as stored per person: sorted by (ts, click_id)
+/// Click as stored per person: sorted by ts
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct ClC {
@@ -2596,7 +2596,7 @@ impl Worker {
         tadd(4, t_p);
     }
 
-    /// evs: one person's events (ts << 32 | meta), unsorted; cls: clicks sorted by (ts, cid).
+    /// evs: one person's events (ts << 32 | meta), unsorted; cls: clicks sorted by ts.
     fn person(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
         let direct = cls.is_empty();
         if PROF.load(Ordering::Relaxed) {
@@ -2661,6 +2661,8 @@ impl Worker {
         // Credit: the latest click at or before the session start, if within 7 days; credited
         // stats are accumulated per run of equal (campaign, day).
         let mut hi = 0usize;
+        let mut tie_q = usize::MAX; // last resolved group of equal-ts clicks and its campaign
+        let mut tie_camp = 0usize;
         let mut a_key = usize::MAX;
         let mut a_sess = 0u32;
         let mut a_purch = 0u32;
@@ -2678,7 +2680,17 @@ impl Worker {
                     while q > 0 && cls.get_unchecked(q - 1).ts == t {
                         q -= 1;
                     }
-                    cls.get_unchecked(q).camp as usize
+                    // cls[q..hi] share the timestamp, in no particular order: the smallest
+                    // click_id wins. The ids are only compared when the campaigns differ.
+                    if q + 1 == hi {
+                        cls.get_unchecked(q).camp as usize
+                    } else {
+                        if q != tie_q {
+                            tie_q = q;
+                            tie_camp = tie_campaign(cls.get_unchecked(q..hi));
+                        }
+                        tie_camp
+                    }
                 } else {
                     organic
                 }
@@ -2712,24 +2724,37 @@ impl Worker {
 /// Partitions with at least this many clicks sort them by radix (see Worker::partition).
 const CL_RADIX_MIN: usize = 512;
 
-#[inline(always)]
-fn click_less(a: &ClC, b: &ClC) -> bool {
-    a.ts < b.ts || (a.ts == b.ts && sget(a.cid) < sget(b.cid))
+/// Campaign of the smallest click_id (bytes) among clicks of equal timestamp.
+#[cold]
+#[inline(never)]
+fn tie_campaign(g: &[ClC]) -> usize {
+    let c0 = g[0].camp;
+    if g.iter().all(|c| c.camp == c0) {
+        return c0 as usize;
+    }
+    let mut best = 0usize;
+    for j in 1..g.len() {
+        if sget(g[j].cid) < sget(g[best].cid) {
+            best = j;
+        }
+    }
+    g[best].camp as usize
 }
 
-/// Finish the (ts, click_id bytes) order of one person's nearly sorted clicks: insertion with a
-/// small step budget, and the general sort when an element is far from its place.
+/// Finish the timestamp order of one person's nearly sorted clicks: insertion with a small step
+/// budget, and the general sort when an element is far from its place. Clicks of equal
+/// timestamp stay in arbitrary order (attribute resolves them, see tie_campaign).
 #[inline]
 fn fix_clicks(cls: &mut [ClC]) {
     for i in 1..cls.len() {
-        if click_less(&cls[i], &cls[i - 1]) {
+        if cls[i].ts < cls[i - 1].ts {
             let x = cls[i];
             let mut j = i;
             let mut steps = 0;
-            while j > 0 && click_less(&x, &cls[j - 1]) {
+            while j > 0 && x.ts < cls[j - 1].ts {
                 if steps == 16 {
                     cls[j] = x;
-                    cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
+                    cls.sort_unstable_by_key(|c| c.ts);
                     return;
                 }
                 cls[j] = cls[j - 1];
@@ -2741,9 +2766,9 @@ fn fix_clicks(cls: &mut [ClC]) {
     }
 }
 
-/// Sort one person's clicks by (ts, click_id bytes). Click ids are unique after dedup, so the
-/// order is total. Small inputs: branch-free rank sort on ts (rank = number of smaller ts);
-/// equal ts values (rare) collide on a rank and take the general path.
+/// Sort one person's clicks by ts (equal timestamps in any order). Small inputs: branch-free
+/// rank sort on ts (rank = number of smaller ts); equal ts values collide on a rank and take
+/// the general path.
 #[inline]
 fn sort_clicks(cls: &mut [ClC]) {
     const SMALL: usize = 64;
@@ -2783,7 +2808,7 @@ fn sort_clicks(cls: &mut [ClC]) {
         }
         cls.copy_from_slice(tmp);
     }
-    cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
+    cls.sort_unstable_by_key(|c| c.ts);
 }
 
 /// Sort u64 keys: insertion sort for small, radix (by the high 32 bits) for large.
