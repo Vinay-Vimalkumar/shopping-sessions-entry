@@ -49,7 +49,7 @@ mod halloc {
                 if p == libc::MAP_FAILED {
                     return std::ptr::null_mut();
                 }
-                libc::madvise(p, sz, libc::MADV_HUGEPAGE);
+                // (no huge-page advice in this experiment)
                 p as *mut u8
             } else {
                 System.alloc(l)
@@ -77,7 +77,7 @@ mod halloc {
                 if q == libc::MAP_FAILED {
                     return std::ptr::null_mut();
                 }
-                libc::madvise(q, round(new_size), libc::MADV_HUGEPAGE);
+                // (no huge-page advice in this experiment)
                 q as *mut u8
             } else if !ob && !nb {
                 System.realloc(p, l, new_size)
