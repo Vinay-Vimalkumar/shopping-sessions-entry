@@ -2633,7 +2633,7 @@ fn main() {
     // partitions sized to stay L2-resident: ~12K event rows each
     let est_rows = ev_bytes / 75 + 1;
     let mut pbits = 8u32;
-    let prows: usize = std::env::var("SS_PROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+    let prows: usize = std::env::var("SS_PROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(24_000);
     while pbits < 12 && (est_rows >> pbits) > prows {
         pbits += 1;
     }
