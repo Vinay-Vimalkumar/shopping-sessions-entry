@@ -1185,7 +1185,7 @@ impl StrMap {
 // ---------------------------------------------------------------- input files
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PF_DIST: AtomicUsize = AtomicUsize::new(1024);
+static PF_DIST: AtomicUsize = AtomicUsize::new(2048);
 static SCAN_BRANCHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // debug accumulators (ns, summed over threads)
 static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
