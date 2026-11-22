@@ -97,34 +97,107 @@ mod halloc {
 #[global_allocator]
 static GA: halloc::HugeAlloc = halloc::HugeAlloc;
 
+/// Records staged per partition before a write-combined flush.
+const WK: usize = 8;
+
 /// Per-thread partitioned buffer: one big allocation, fixed capacity per partition, overflow Vecs.
+/// Pushes are staged WK at a time in a small cache-resident buffer and flushed as whole cache
+/// lines (non-temporal stores on Linux/AVX2 builds), so scattering does not stall on misses.
 struct PartBuf<T: Copy> {
     mem: Vec<T>,
     cap: usize,
     lens: Vec<u32>,
     over: Vec<Vec<T>>,
+    stage: Vec<T>,
+    slen: Vec<u32>,
+    nt: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn nt_copy(src: *const u8, dst: *mut u8, bytes: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0;
+    while i < bytes {
+        let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+        _mm256_stream_si256(dst.add(i) as *mut __m256i, v);
+        i += 32;
+    }
 }
 
 impl<T: Copy> PartBuf<T> {
     fn new(nparts: usize, cap: usize) -> Self {
+        let cap = (cap + WK - 1) / WK * WK;
+        let mem: Vec<T> = Vec::with_capacity(nparts * cap);
+        let nt = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+            && (mem.as_ptr() as usize) % 32 == 0
+            && (std::mem::size_of::<T>() * WK) % 32 == 0;
         PartBuf {
-            mem: Vec::with_capacity(nparts * cap),
+            mem,
             cap,
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| Vec::new()).collect(),
+            stage: Vec::with_capacity(nparts * WK),
+            slen: vec![0; nparts],
+            nt,
         }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T) {
         unsafe {
-            let l = *self.lens.get_unchecked(p) as usize;
-            if l < self.cap {
-                self.mem.as_mut_ptr().add(p * self.cap + l).write(v);
-                *self.lens.get_unchecked_mut(p) = (l + 1) as u32;
+            let n = *self.slen.get_unchecked(p) as usize;
+            self.stage.as_mut_ptr().add(p * WK + n).write(v);
+            if n + 1 < WK {
+                *self.slen.get_unchecked_mut(p) = (n + 1) as u32;
             } else {
-                self.over.get_unchecked_mut(p).push(v);
+                *self.slen.get_unchecked_mut(p) = 0;
+                self.flush_full(p);
             }
         }
+    }
+    #[inline(always)]
+    unsafe fn flush_full(&mut self, p: usize) {
+        let l = *self.lens.get_unchecked(p) as usize;
+        let src = self.stage.as_ptr().add(p * WK);
+        if l + WK <= self.cap {
+            let dst = self.mem.as_mut_ptr().add(p * self.cap + l);
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                if self.nt {
+                    nt_copy(src as *const u8, dst as *mut u8, WK * std::mem::size_of::<T>());
+                } else {
+                    std::ptr::copy_nonoverlapping(src, dst, WK);
+                }
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            std::ptr::copy_nonoverlapping(src, dst, WK);
+            *self.lens.get_unchecked_mut(p) = (l + WK) as u32;
+        } else {
+            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src, WK));
+        }
+    }
+    /// Flush staged records; must be called before reading.
+    fn finish(&mut self) {
+        unsafe {
+            for p in 0..self.lens.len() {
+                let n = self.slen[p] as usize;
+                if n == 0 {
+                    continue;
+                }
+                let l = self.lens[p] as usize;
+                let src = self.stage.as_ptr().add(p * WK);
+                if l + n <= self.cap {
+                    std::ptr::copy_nonoverlapping(src, self.mem.as_mut_ptr().add(p * self.cap + l), n);
+                    self.lens[p] = (l + n) as u32;
+                } else {
+                    self.over[p].extend_from_slice(std::slice::from_raw_parts(src, n));
+                }
+                self.slen[p] = 0;
+            }
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_sfence();
+        }
+        self.stage = Vec::new();
     }
     #[inline(always)]
     fn main(&self, p: usize) -> &[T] {
@@ -2348,6 +2421,7 @@ fn main() {
             }
         }
         st.flush(&ut);
+        st.ev.finish();
         let el = t.elapsed().as_secs_f64() * 1e9;
         eprintln!("bench {mode}: {lines} lines, {:.1} ns/line, users {}", el / lines as f64, ut.n_users());
         std::process::exit(0);
@@ -2486,6 +2560,7 @@ fn main() {
                         }
                     }
                     st.flush(ut);
+                    st.ev.finish();
                     P1 { ev: st.ev, cl: st.cl }
                 })
             })
@@ -2618,6 +2693,8 @@ fn main() {
                             tadd(2, t_c);
                         }
                     }
+                    r.ev.finish();
+                    r.cl.finish();
                     r
                 })
             })
