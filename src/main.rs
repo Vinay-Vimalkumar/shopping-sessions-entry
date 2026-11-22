@@ -151,6 +151,20 @@ fn par_drop<T: Send>(items: Vec<T>) {
 // ---------------------------------------------------------------- logging
 static T0: OnceLock<Instant> = OnceLock::new();
 static LOG_ON: OnceLock<bool> = OnceLock::new();
+/// With SS_LOG on Linux: log resident and huge-page anonymous memory.
+fn log_mem(tag: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        if *LOG_ON.get_or_init(|| std::env::var_os("SS_LOG").is_some()) {
+            let sm = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+            let pick = |k: &str| sm.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("0").to_string()).unwrap_or_default();
+            log(&format!("mem {tag}: rss {} kB, anon {} kB, anon-huge {} kB", pick("Rss:"), pick("Anonymous:"), pick("AnonHugePages:")));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tag;
+}
+
 fn log(msg: &str) {
     if *LOG_ON.get_or_init(|| std::env::var_os("SS_LOG").is_some()) {
         let t = T0.get().unwrap().elapsed().as_secs_f64() * 1000.0;
@@ -914,6 +928,7 @@ impl StrMap {
 
 // ---------------------------------------------------------------- input files
 static MAPS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // debug accumulators (ns, summed over threads)
 static TACC: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 #[inline(always)]
@@ -1903,8 +1918,17 @@ impl Worker {
 
     /// evs: one person's events (ts << 32 | meta) sorted; cls: clicks sorted by (ts, cid).
     fn person(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
-        self.sessionize_cells(name, evs, base, base_day_off);
-        self.attribute(cls, organic);
+        if PROF.load(Ordering::Relaxed) {
+            let t = Instant::now();
+            self.sessionize_cells(name, evs, base, base_day_off);
+            tadd(5, t);
+            let t = Instant::now();
+            self.attribute(cls, organic);
+            tadd(6, t);
+        } else {
+            self.sessionize_cells(name, evs, base, base_day_off);
+            self.attribute(cls, organic);
+        }
     }
 
     #[allow(dead_code)]
@@ -2159,6 +2183,42 @@ fn main() {
     let mut lchunks = Vec::new();
     make_chunks(Kind::Link, &ln_files, 256 << 10, &mut lchunks);
     log(&format!("setup done: {} chunks, {} threads, ndays {}", chunks.len(), nthreads, ndays));
+    if std::env::var_os("SS_PROF").is_some() {
+        PROF.store(true, Ordering::Relaxed);
+    }
+    if let Ok(mode) = std::env::var("SS_BENCH") {
+        // debug micro-benchmark: one thread parses every event chunk (full work incl. interning)
+        for &f in ev_files.iter() {
+            let mut acc = 0u8;
+            for k in (0..f.len()).step_by(4096) {
+                acc ^= f[k];
+            }
+            std::hint::black_box(acc);
+        }
+        let est_ev = ev_bytes / 75 + 1024;
+        let ut = UTab::new(((est_ev / 10) * 3 / 2).next_power_of_two().max(1 << 16), est_ev);
+        let mut st = PState::new(npart, est_ev * 3 / 2 / npart + 64, 1024);
+        let mut lines = 0usize;
+        let t = Instant::now();
+        for c in chunks.iter().filter(|c| c.kind == Kind::Event) {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let mut cb = |f: &[&'static [u8]; 7]| {
+                    lines += 1;
+                    if mode == "split" {
+                        std::hint::black_box(f);
+                        return;
+                    }
+                    event_fields(f, &cx, &mut st, &ut);
+                };
+                scan_fields::<7, _>(c.data, c.start, c.end, &mut cb);
+            }
+        }
+        st.flush(&ut);
+        let el = t.elapsed().as_secs_f64() * 1e9;
+        eprintln!("bench {mode}: {lines} lines, {:.1} ns/line, users {}", el / lines as f64, ut.n_users());
+        std::process::exit(0);
+    }
     if std::env::var_os("SS_PRETOUCH").is_some() {
         // debug: fault in all input pages first, to separate page-fault cost from parse cost
         let all: Vec<&'static [u8]> = ev_files.iter().chain(cl_files.iter()).chain(ln_files.iter()).copied().collect();
@@ -2189,8 +2249,9 @@ fn main() {
     let ln_bytes: usize = ln_files.iter().map(|f| f.len()).sum();
     let est_cl = cl_bytes / 50 + 1024;
     let cl_cap = est_cl * 3 / 2 / nthreads + 1024;
-    let est_users = (est_ev + est_cl) / 10 + ln_bytes / 12 + 4096;
-    let cap_slots = (est_users * 3 / 2).next_power_of_two().max(1 << 16);
+    // distinct user IDs are ~8% of event rows; size for ~2.5x that (load stays < 0.45)
+    let est_users = (est_ev + est_cl) / 12 + ln_bytes / 16 + 4096;
+    let cap_slots = est_users.next_power_of_two().max(1 << 16);
     let cap_users = cap_slots * 2 + (nthreads + 8) * UBLOCK as usize;
     let ut = UTab::new(cap_slots, cap_users);
     let next = AtomicUsize::new(0);
@@ -2428,6 +2489,7 @@ fn main() {
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    log_mem("phase 2 end (p1+p2 live)");
     par_drop(p1);
     log("phase 2 dedup done");
 
@@ -2478,12 +2540,14 @@ fn main() {
     par_drop(p2);
     log("phase 3 sessions done");
     log(&format!(
-        "cpu ms: dedup-table {:.0}, dedup-emit {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0}",
+        "cpu ms: dedup-table {:.0}, dedup-emit {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (cells {:.0}, attrib {:.0})",
         TACC[0].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[1].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[2].load(Ordering::Relaxed) as f64 / 1e6,
         TACC[3].load(Ordering::Relaxed) as f64 / 1e6,
-        TACC[4].load(Ordering::Relaxed) as f64 / 1e6
+        TACC[4].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[5].load(Ordering::Relaxed) as f64 / 1e6,
+        TACC[6].load(Ordering::Relaxed) as f64 / 1e6
     ));
 
     // ---------------- phase 4: write
