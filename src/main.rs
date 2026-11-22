@@ -1558,7 +1558,7 @@ struct UTab {
     mask: usize,
     blocks: AtomicU32,
     uref: Vec<AtomicU64>, // user index -> sref of the uid text
-    spill: Mutex<Vec<(u64, u32)>>,
+    spill: Mutex<std::collections::HashMap<u64, u32>>,
 }
 
 impl UTab {
@@ -1568,7 +1568,7 @@ impl UTab {
             mask: cap_slots - 1,
             blocks: AtomicU32::new(0),
             uref: zeroed_vec(cap_users),
-            spill: Mutex::new(Vec::new()),
+            spill: Mutex::new(std::collections::HashMap::new()),
         }
     }
     #[inline(always)]
@@ -1628,14 +1628,12 @@ impl UTab {
     #[cold]
     fn spill_get(&self, h: u64, s: u64, a: &mut IdxAlloc) -> u32 {
         let mut g = self.spill.lock().unwrap();
-        for &(k, u) in g.iter() {
-            if k == h {
-                return u;
-            }
+        if let Some(&u) = g.get(&h) {
+            return u;
         }
         let u = self.new_index(a);
         self.uref[u as usize].store(s, Ordering::Relaxed);
-        g.push((h, u));
+        g.insert(h, u);
         u
     }
     /// Upper bound on user indices handed out.
@@ -2461,7 +2459,15 @@ fn main() {
     // distinct user IDs are ~8% of event rows; size for ~2.5x that (load stays < 0.45)
     let est_users = (est_ev + est_cl) / 12 + ln_bytes / 16 + 4096;
     let cap_slots = est_users.next_power_of_two().max(1 << 16);
-    let cap_users = cap_slots * 2 + (nthreads + 8) * UBLOCK as usize;
+    // User indices are dense. Size the per-user arrays from a hard upper bound on distinct IDs
+    // (a valid row is at least ~24 bytes and names at most two IDs), so they can never overflow;
+    // on Linux untouched pages cost only address space.
+    let bound_users = ev_bytes / 24 + cl_bytes / 16 + ln_bytes / 3 + 1024;
+    let cap_users = if cfg!(target_os = "linux") {
+        bound_users.max(cap_slots * 4)
+    } else {
+        (cap_slots * 4).min(bound_users.max(cap_slots))
+    } + (nthreads + 8) * UBLOCK as usize;
     let ut = UTab::new(cap_slots, cap_users);
     let next = AtomicUsize::new(0);
     let parent_cell: OnceLock<Vec<u32>> = OnceLock::new();
