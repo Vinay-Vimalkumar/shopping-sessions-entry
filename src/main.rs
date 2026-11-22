@@ -1856,6 +1856,30 @@ struct ClC {
     camp: u32,
 }
 
+/// One 30-minute cell of the current person. Resting state (between persons) is CELL0, so the
+/// per-event update needs no "first event of the cell" branch.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct Cell {
+    min: u32,
+    max: u32,
+    cnt: u32,
+    sess: u32, // session index of the cell (valid for the cells of the current person)
+    rev: u64,
+}
+const CELL0: Cell = Cell { min: u32::MAX, max: 0, cnt: 0, sess: 0, rev: 0 };
+
+/// One session of the current person.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Sess {
+    start: u32,
+    day: u32,
+    rev: u64,
+    run: u32, // index into runs
+    _pad: u32,
+}
+
 struct Worker {
     // campaign stats export: [camp * ndays + day] -> sessions, purchasing, revenue, assisted
     // (filled by finalize_stats from the compact arrays below)
@@ -1867,14 +1891,10 @@ struct Worker {
     dshift: u32,
     ndays: usize,
     ncat: usize,
-    cnt: Vec<u32>,
-    open: Vec<u32>,
-    touched: Vec<u32>,
-    catrev: Vec<u64>,
-    sess_start: Vec<u32>,
-    sess_day: Vec<u32>,
-    sess_rev: Vec<u64>,
-    run_of: Vec<u32>,
+    aend: Vec<u64>, // per campaign: person stamp << 32 | end of its last assist range
+    stamp: u32,
+    sess: Vec<Sess>, // sessions of the current person: [0, sess_n)
+    sess_n: usize,
     runs: Vec<(u32, u32)>, // (day, first session idx)
     rows: Vec<UserRow>,
     // grouping scratch
@@ -1887,15 +1907,14 @@ struct Worker {
     ev_sorted: Vec<u64>,
     cl_sorted: Vec<ClC>,
     cl_pidx: Vec<u32>,
+    cl_a: Vec<ClB>, // click radix scratch
+    cl_b: Vec<ClB>,
+    rhist: Vec<u32>,
     // 30-minute cells (sessions can only break between non-empty cells)
-    cmin: Vec<u32>,
-    cmax: Vec<u32>,
-    ccnt: Vec<u32>,
-    crev: Vec<u64>,
-    csess: Vec<u32>,
+    cells: Vec<Cell>,
     cbits: Vec<u64>,
-    sess_cnt: Vec<u32>,
-    dcat: Vec<u64>, // [day * ncat + cat] purchase revenue
+    purch: Vec<u64>, // purchase events of the current person
+    dcat: Vec<u64>,  // [day * ncat + cat] purchase revenue
 }
 
 impl Worker {
@@ -1908,14 +1927,10 @@ impl Worker {
             dshift: 0,
             ndays,
             ncat,
-            cnt: vec![0; ncamp + 1],
-            open: vec![0; ncamp + 1],
-            touched: Vec::new(),
-            catrev: vec![0; ncat],
-            sess_start: Vec::new(),
-            sess_day: Vec::new(),
-            sess_rev: Vec::new(),
-            run_of: Vec::new(),
+            aend: vec![0; ncamp + 1],
+            stamp: 0,
+            sess: Vec::new(),
+            sess_n: 0,
             runs: Vec::new(),
             rows: Vec::new(),
             pmap: U64Map::with_capacity(1024),
@@ -1927,13 +1942,12 @@ impl Worker {
             ev_sorted: Vec::new(),
             cl_sorted: Vec::new(),
             cl_pidx: Vec::new(),
-            cmin: Vec::new(),
-            cmax: Vec::new(),
-            ccnt: Vec::new(),
-            crev: Vec::new(),
-            csess: Vec::new(),
+            cl_a: Vec::new(),
+            cl_b: Vec::new(),
+            rhist: Vec::new(),
+            cells: Vec::new(),
             cbits: Vec::new(),
-            sess_cnt: Vec::new(),
+            purch: Vec::new(),
             dcat: vec![0; ndays * ncat],
         }
     }
@@ -1966,132 +1980,172 @@ impl Worker {
     }
 
     fn ensure_cells(&mut self, ncells: usize) {
-        if self.cmin.len() < ncells {
-            self.cmin = vec![0; ncells];
-            self.cmax = vec![0; ncells];
-            self.ccnt = vec![0; ncells];
-            self.crev = vec![0; ncells];
-            self.csess = vec![0; ncells];
+        if self.cells.len() < ncells {
+            self.cells = vec![CELL0; ncells];
+            // a session starts at a non-empty cell, so there are at most ncells of them
+            self.sess = vec![Sess { start: 0, day: 0, rev: 0, run: 0, _pad: 0 }; ncells + 1];
             self.cbits = vec![0; (ncells + 63) / 64];
         }
     }
 
-    /// Sessions from unsorted events (ts << 32 | meta) via 30-minute cells; fills sess_* and runs,
-    /// and emits the user_daily rows.
-    fn sessionize_cells(&mut self, name: u64, evs: &[u64], base: i64, base_day_off: i64) {
-        self.sess_start.clear();
-        self.sess_day.clear();
-        self.sess_rev.clear();
-        self.sess_cnt.clear();
+    /// Sessions from unsorted events (ts << 32 | meta) via 30-minute cells; fills sess and runs,
+    /// and emits the user_daily rows. With `direct` (the person has no clicks) every session is
+    /// organic and the campaign stats are written here, one update per day.
+    fn sessionize_cells(&mut self, name: u64, evs: &[u64], base: i64, base_day_off: i64, direct: bool, organic: usize) {
         self.runs.clear();
-        self.run_of.clear();
-        let mut cmin_c = usize::MAX;
-        let mut cmax_c = 0usize;
+        if self.purch.len() <= evs.len() {
+            self.purch.resize(evs.len() + 1, 0);
+        }
+        let cells = self.cells.as_mut_ptr();
+        let bits = self.cbits.as_mut_ptr();
+        let purch = self.purch.as_mut_ptr();
+        let sess = self.sess.as_mut_ptr();
+        let mut np = 0usize;
+        let mut cmin_c = u32::MAX;
+        let mut cmax_c = 0u32;
+        let mut wmask = 0u64; // non-empty bitmap words (exact when there are at most 64 words)
         for &e in evs {
             let ts = (e >> 32) as u32;
-            let price = (e as u32 & 0xFF_FFFF) as u64;
-            let c = (ts / GAP_MS) as usize;
-            let w = c >> 6;
-            let b = 1u64 << (c & 63);
+            let price = e as u32 & 0xFF_FFFF;
+            let c = ts / GAP_MS;
             unsafe {
-                let bw = self.cbits.get_unchecked_mut(w);
-                if *bw & b == 0 {
-                    *bw |= b;
-                    *self.cmin.get_unchecked_mut(c) = ts;
-                    *self.cmax.get_unchecked_mut(c) = ts;
-                    *self.ccnt.get_unchecked_mut(c) = 1;
-                    *self.crev.get_unchecked_mut(c) = price;
-                } else {
-                    let m = self.cmin.get_unchecked_mut(c);
-                    *m = (*m).min(ts);
-                    let x = self.cmax.get_unchecked_mut(c);
-                    *x = (*x).max(ts);
-                    *self.ccnt.get_unchecked_mut(c) += 1;
-                    *self.crev.get_unchecked_mut(c) += price;
-                }
+                let cell = &mut *cells.add(c as usize);
+                cell.min = cell.min.min(ts);
+                cell.max = cell.max.max(ts);
+                cell.cnt += 1;
+                cell.rev += price as u64;
+                *bits.add((c >> 6) as usize) |= 1u64 << (c & 63);
+                *purch.add(np) = e;
             }
-            if c < cmin_c {
-                cmin_c = c;
-            }
-            if c > cmax_c {
-                cmax_c = c;
-            }
+            np += (price != 0) as usize;
+            wmask |= 1u64 << ((c >> 6) & 63);
+            cmin_c = cmin_c.min(c);
+            cmax_c = cmax_c.max(c);
         }
         // walk cells in time order
+        let row0 = self.rows.len();
+        let org = organic * self.nd;
+        let mut k = 0usize; // sessions so far
         let mut prev_max: u32 = 0;
-        let mut have = false;
-        for w in (cmin_c >> 6)..=(cmax_c >> 6) {
-            let mut bits = self.cbits[w];
-            self.cbits[w] = 0;
-            while bits != 0 {
-                let c = (w << 6) | bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let lo = self.cmin[c];
-                if !have || lo - prev_max > GAP_MS {
-                    have = true;
-                    let day = (((base + lo as i64).div_euclid(DAY_MS)) - base_day_off) as u32;
-                    if self.runs.last().map(|r| r.0) != Some(day) {
-                        self.runs.push((day, self.sess_start.len() as u32));
-                    }
-                    self.run_of.push((self.runs.len() - 1) as u32);
-                    self.sess_start.push(lo);
-                    self.sess_day.push(day);
-                    self.sess_rev.push(0);
-                    self.sess_cnt.push(0);
+        let mut day: u32 = 0;
+        let mut day_lim: i64 = i64::MIN; // first ts after the current day
+        let mut s_rev = 0u64; // revenue of the open session
+        let mut r_first = 0usize; // open day run: first session, events, revenue, purchasing sessions
+        let mut r_events = 0u32;
+        let mut r_rev = 0u64;
+        let mut r_purch = 0u32;
+        macro_rules! flush_run {
+            () => {
+                self.rows.push(UserRow {
+                    name,
+                    day: (base_day_off + day as i64) as i32,
+                    sessions: (k - r_first) as u32,
+                    events: r_events,
+                    revenue: r_rev,
+                    top: u32::MAX,
+                });
+                if direct {
+                    let st = unsafe { self.cstat.get_unchecked_mut(org + (day - self.dshift) as usize) };
+                    st.sessions += (k - r_first) as u32;
+                    st.purchasing += r_purch;
+                    st.revenue += r_rev;
                 }
-                let k = self.sess_start.len() - 1;
-                self.sess_cnt[k] += self.ccnt[c];
-                self.sess_rev[k] += self.crev[c];
-                self.csess[c] = k as u32;
-                prev_max = self.cmax[c];
+            };
+        }
+        let small = self.cbits.len() <= 64;
+        let mut w_next = (cmin_c >> 6) as usize;
+        let w_last = (cmax_c >> 6) as usize;
+        loop {
+            let w;
+            if small {
+                if wmask == 0 {
+                    break;
+                }
+                w = wmask.trailing_zeros() as usize;
+                wmask &= wmask - 1;
+            } else {
+                if w_next > w_last {
+                    break;
+                }
+                w = w_next;
+                w_next += 1;
+            }
+            let mut b = unsafe { *bits.add(w) };
+            unsafe { *bits.add(w) = 0 };
+            while b != 0 {
+                let c = (w << 6) | b.trailing_zeros() as usize;
+                b &= b - 1;
+                let cell = unsafe { &mut *cells.add(c) };
+                let lo = cell.min;
+                if k == 0 || lo - prev_max > GAP_MS {
+                    if k > 0 {
+                        unsafe { (*sess.add(k - 1)).rev = s_rev };
+                        r_rev += s_rev;
+                        r_purch += (s_rev > 0) as u32;
+                    }
+                    if lo as i64 >= day_lim {
+                        if k > 0 {
+                            flush_run!();
+                        }
+                        let ad = (base + lo as i64).div_euclid(DAY_MS);
+                        day = (ad - base_day_off) as u32;
+                        day_lim = (ad + 1) * DAY_MS - base;
+                        self.runs.push((day, k as u32));
+                        r_first = k;
+                        r_events = 0;
+                        r_rev = 0;
+                        r_purch = 0;
+                    }
+                    unsafe {
+                        *sess.add(k) = Sess { start: lo, day, rev: 0, run: (self.runs.len() - 1) as u32, _pad: 0 };
+                    }
+                    k += 1;
+                    s_rev = 0;
+                }
+                s_rev += cell.rev;
+                r_events += cell.cnt;
+                prev_max = cell.max;
+                *cell = Cell { min: u32::MAX, max: 0, cnt: 0, sess: (k - 1) as u32, rev: 0 };
             }
         }
-        // purchases -> category revenue of the session's day
-        let ncat = self.ncat;
-        let mut any_purchase = false;
-        for &e in evs {
-            let meta = e as u32;
-            let price = meta & 0xFF_FFFF;
-            if price != 0 {
+        if k > 0 {
+            unsafe { (*sess.add(k - 1)).rev = s_rev };
+            r_rev += s_rev;
+            r_purch += (s_rev > 0) as u32;
+            flush_run!();
+        }
+        self.sess_n = k;
+        // purchases -> top category of the session's day
+        if np == 1 {
+            let e = self.purch[0];
+            let ts = (e >> 32) as u32;
+            let r = unsafe { (*sess.add((*cells.add((ts / GAP_MS) as usize)).sess as usize)).run } as usize;
+            self.rows[row0 + r].top = e as u32 >> 24;
+        } else if np > 1 {
+            let ncat = self.ncat;
+            for i in 0..np {
+                let e = self.purch[i];
+                let meta = e as u32;
                 let ts = (e >> 32) as u32;
-                let k = self.csess[(ts / GAP_MS) as usize] as usize;
-                let d = self.sess_day[k] as usize;
-                self.dcat[d * ncat + (meta >> 24) as usize] += price as u64;
-                any_purchase = true;
+                let d = unsafe { (*sess.add((*cells.add((ts / GAP_MS) as usize)).sess as usize)).day } as usize;
+                self.dcat[d * ncat + (meta >> 24) as usize] += (meta & 0xFF_FFFF) as u64;
             }
-        }
-        // user_daily rows: one per day run
-        let nruns = self.runs.len();
-        for r in 0..nruns {
-            let (day, first) = self.runs[r];
-            let end = if r + 1 < nruns { self.runs[r + 1].1 as usize } else { self.sess_start.len() };
-            let first = first as usize;
-            let mut events = 0u32;
-            let mut revenue = 0u64;
-            for k in first..end {
-                events += self.sess_cnt[k];
-                revenue += self.sess_rev[k];
-            }
-            let mut top = u32::MAX;
-            if any_purchase && revenue > 0 {
-                let row = &mut self.dcat[day as usize * ncat..(day as usize + 1) * ncat];
-                let mut best = 0u64;
-                for (ci, v) in row.iter_mut().enumerate() {
-                    if *v > best {
-                        best = *v;
-                        top = ci as u32;
+            for r in 0..self.runs.len() {
+                if self.rows[row0 + r].revenue > 0 {
+                    let day = self.runs[r].0 as usize;
+                    let row = &mut self.dcat[day * ncat..(day + 1) * ncat];
+                    let mut best = 0u64;
+                    let mut top = u32::MAX;
+                    for (ci, v) in row.iter_mut().enumerate() {
+                        if *v > best {
+                            best = *v;
+                            top = ci as u32;
+                        }
+                        *v = 0;
                     }
-                    *v = 0;
+                    self.rows[row0 + r].top = top;
                 }
             }
-            self.rows.push(UserRow {
-                name,
-                day: (base_day_off + day as i64) as i32,
-                sessions: (end - first) as u32,
-                events,
-                revenue,
-                top,
-            });
         }
     }
 
@@ -2100,7 +2154,7 @@ impl Worker {
         if k0 >= k1 {
             return;
         }
-        let mut r = self.run_of[k0] as usize;
+        let mut r = self.sess[k0].run as usize;
         let nruns = self.runs.len();
         while r < nruns {
             let (day, first) = self.runs[r];
@@ -2108,7 +2162,7 @@ impl Worker {
             if first >= k1 {
                 break;
             }
-            let end = if r + 1 < nruns { self.runs[r + 1].1 as usize } else { self.sess_start.len() };
+            let end = if r + 1 < nruns { self.runs[r + 1].1 as usize } else { self.sess_n };
             let lo = k0.max(first);
             let hi = k1.min(end);
             if hi > lo {
@@ -2167,11 +2221,15 @@ impl Worker {
             }
         }
         // clicks by person
+        let ncl: usize = clp.iter().map(|s| s.len()).sum();
+        let radix = ncl >= CL_RADIX_MIN;
         self.pcl.clear();
         self.pcl.resize(qsize, 0);
+        let mut ts_max = 0u32;
         for s in clp {
             for c in s.iter() {
                 unsafe { *self.pcl.get_unchecked_mut((c.person - qbase) as usize) += 1 };
+                ts_max = ts_max.max(c.ts);
             }
         }
         self.cl_pidx.clear();
@@ -2185,13 +2243,74 @@ impl Worker {
         self.cl_pidx.push(acc);
         self.cl_sorted.clear();
         self.cl_sorted.resize(acc as usize, ClC { cid: 0, ts: 0, camp: 0 });
-        for s in clp {
-            for c in s.iter() {
-                let p = (c.person - qbase) as usize;
+        if radix {
+            // Stable LSD radix sort of the partition's clicks on the top 16 bits of ts (two
+            // 8-bit digits), then the stable scatter by person: each person's clicks come out
+            // ordered by ts up to the dropped low bits and click_id ties, which fix_clicks repairs.
+            const RB: usize = 8;
+            const RM: u32 = (1 << RB) - 1;
+            let sh = (32 - ts_max.leading_zeros()).saturating_sub(2 * RB as u32);
+            self.rhist.clear();
+            self.rhist.resize(2 << RB, 0);
+            // every slot of both buffers is written below (the cursors are exact prefix sums)
+            self.cl_a.clear();
+            self.cl_a.reserve(ncl);
+            self.cl_b.clear();
+            self.cl_b.reserve(ncl);
+            unsafe {
+                self.cl_a.set_len(ncl);
+                self.cl_b.set_len(ncl);
+            }
+            let (h0, h1) = self.rhist.split_at_mut(1 << RB);
+            for s in clp {
+                for c in s.iter() {
+                    let k = c.ts >> sh;
+                    unsafe {
+                        *h0.get_unchecked_mut((k & RM) as usize) += 1;
+                        *h1.get_unchecked_mut((k >> RB) as usize) += 1;
+                    }
+                }
+            }
+            for h in [&mut *h0, &mut *h1] {
+                let mut acc = 0u32;
+                for c in h.iter_mut() {
+                    let n = *c;
+                    *c = acc;
+                    acc += n;
+                }
+            }
+            for s in clp {
+                for c in s.iter() {
+                    unsafe {
+                        let d = h0.get_unchecked_mut(((c.ts >> sh) & RM) as usize);
+                        *self.cl_a.get_unchecked_mut(*d as usize) = *c;
+                        *d += 1;
+                    }
+                }
+            }
+            for c in self.cl_a.iter() {
                 unsafe {
-                    let w = *self.pcl.get_unchecked(p) as usize;
-                    *self.pcl.get_unchecked_mut(p) += 1;
-                    *self.cl_sorted.get_unchecked_mut(w) = ClC { cid: c.cid, ts: c.ts, camp: c.camp };
+                    let d = h1.get_unchecked_mut((c.ts >> sh >> RB) as usize);
+                    *self.cl_b.get_unchecked_mut(*d as usize) = *c;
+                    *d += 1;
+                }
+            }
+            for c in self.cl_b.iter() {
+                unsafe {
+                    let d = self.pcl.get_unchecked_mut((c.person - qbase) as usize);
+                    *self.cl_sorted.get_unchecked_mut(*d as usize) = ClC { cid: c.cid, ts: c.ts, camp: c.camp };
+                    *d += 1;
+                }
+            }
+        } else {
+            for s in clp {
+                for c in s.iter() {
+                    let p = (c.person - qbase) as usize;
+                    unsafe {
+                        let w = *self.pcl.get_unchecked(p) as usize;
+                        *self.pcl.get_unchecked_mut(p) += 1;
+                        *self.cl_sorted.get_unchecked_mut(w) = ClC { cid: c.cid, ts: c.ts, camp: c.camp };
+                    }
                 }
             }
         }
@@ -2207,8 +2326,10 @@ impl Worker {
                 continue;
             }
             let cls = &mut cl_sorted[cstarts[p] as usize..cstarts[p + 1] as usize];
-            if cls.len() > 1 {
-                cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
+            if radix {
+                fix_clicks(cls);
+            } else {
+                sort_clicks(cls);
             }
             let name = ut.name(qbase + p as u32);
             self.person(name, &ev_sorted[e0..e1], cls, base, base_day_off, organic);
@@ -2220,155 +2341,194 @@ impl Worker {
         tadd(4, t_p);
     }
 
-    /// evs: one person's events (ts << 32 | meta) sorted; cls: clicks sorted by (ts, cid).
+    /// evs: one person's events (ts << 32 | meta), unsorted; cls: clicks sorted by (ts, cid).
     fn person(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
+        let direct = cls.is_empty();
         if PROF.load(Ordering::Relaxed) {
             let t = Instant::now();
-            self.sessionize_cells(name, evs, base, base_day_off);
+            self.sessionize_cells(name, evs, base, base_day_off, direct, organic);
             tadd(5, t);
-            let t = Instant::now();
-            self.attribute(cls, organic);
-            tadd(6, t);
+            if !direct {
+                let t = Instant::now();
+                self.attribute(cls, organic);
+                tadd(6, t);
+            }
         } else {
-            self.sessionize_cells(name, evs, base, base_day_off);
-            self.attribute(cls, organic);
-        }
-    }
-
-    #[allow(dead_code)]
-    fn person_sorted(&mut self, name: u64, evs: &[u64], cls: &[ClC], base: i64, base_day_off: i64, organic: usize) {
-        self.sess_start.clear();
-        self.sess_day.clear();
-        self.sess_rev.clear();
-        self.runs.clear();
-        self.run_of.clear();
-        let n = evs.len();
-        let mut i = 0;
-        let mut cur_day: u32 = u32::MAX;
-        let mut d_sess = 0u32;
-        let mut d_events = 0u32;
-        let mut d_rev = 0u64;
-        let mut cat_touched = false;
-        while i < n {
-            let start = (evs[i] >> 32) as u32;
-            let day = (((base + start as i64).div_euclid(DAY_MS)) - base_day_off) as u32;
-            let mut last = start;
-            let mut rev = 0u64;
-            let mut cnt = 0u32;
-            if day != cur_day {
-                if cur_day != u32::MAX {
-                    self.emit_row(name, cur_day, d_sess, d_events, d_rev, cat_touched, base_day_off);
-                }
-                cur_day = day;
-                d_sess = 0;
-                d_events = 0;
-                d_rev = 0;
-                cat_touched = false;
-                self.runs.push((day, self.sess_start.len() as u32));
+            self.sessionize_cells(name, evs, base, base_day_off, direct, organic);
+            if !direct {
+                self.attribute(cls, organic);
             }
-            while i < n {
-                let e = evs[i];
-                let ts = (e >> 32) as u32;
-                if ts - last > GAP_MS {
-                    break;
-                }
-                last = ts;
-                cnt += 1;
-                let meta = e as u32;
-                let price = meta & 0xFF_FFFF;
-                if price != 0 {
-                    rev += price as u64;
-                    self.catrev[(meta >> 24) as usize] += price as u64;
-                    cat_touched = true;
-                }
-                i += 1;
-            }
-            d_sess += 1;
-            d_events += cnt;
-            d_rev += rev;
-            self.run_of.push((self.runs.len() - 1) as u32);
-            self.sess_start.push(start);
-            self.sess_day.push(day);
-            self.sess_rev.push(rev);
         }
-        self.emit_row(name, cur_day, d_sess, d_events, d_rev, cat_touched, base_day_off);
-        self.attribute(cls, organic);
     }
 
     fn attribute(&mut self, cls: &[ClC], organic: usize) {
-        let s_n = self.sess_start.len();
+        let s_n = self.sess_n;
         let nc = cls.len();
-        let mut lo = 0usize;
+        let nd = self.nd;
+        let dshift = self.dshift;
+        // Assists. Click i (at t) assists the sessions starting in [t, t + 7d]: the index range
+        // [a, b), and both ends only move forward with i. Per campaign the ranges are merged by
+        // remembering where its previous range ended (aend, valid when its stamp is this person's).
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.aend.iter_mut().for_each(|x| *x = 0);
+            self.stamp = 1;
+        }
+        let stamp = (self.stamp as u64) << 32;
+        let mut a = 0usize;
+        let mut b = 0usize;
+        for i in 0..nc {
+            let cl = unsafe { *cls.get_unchecked(i) };
+            let t = cl.ts;
+            unsafe {
+                while a < s_n && self.sess.get_unchecked(a).start < t {
+                    a += 1;
+                }
+                if a == s_n {
+                    break;
+                }
+                if b < a {
+                    b = a;
+                }
+                let lim = t as i64 + WEEK_MS;
+                while b < s_n && self.sess.get_unchecked(b).start as i64 <= lim {
+                    b += 1;
+                }
+                if b > a {
+                    let c = cl.camp as usize;
+                    let e = self.aend.get_unchecked_mut(c);
+                    let from = if *e >> 32 == stamp >> 32 { (*e as u32 as usize).max(a) } else { a };
+                    *e = stamp | b as u64;
+                    self.close(c, from, b);
+                }
+            }
+        }
+        // Credit: the latest click at or before the session start, if within 7 days; credited
+        // stats are accumulated per run of equal (campaign, day).
         let mut hi = 0usize;
+        let mut a_key = usize::MAX;
+        let mut a_sess = 0u32;
+        let mut a_purch = 0u32;
+        let mut a_rev = 0u64;
         for k in 0..s_n {
-            let s = self.sess_start[k];
-            let s_lo = s as i64 - WEEK_MS;
-            while hi < nc && cls[hi].ts <= s {
-                let c = cls[hi].camp as usize;
-                if self.cnt[c] == 0 {
-                    self.open[c] = k as u32;
-                    self.touched.push(c as u32);
+            let se = unsafe { *self.sess.get_unchecked(k) };
+            let s = se.start;
+            let credited = unsafe {
+                while hi < nc && cls.get_unchecked(hi).ts <= s {
+                    hi += 1;
                 }
-                self.cnt[c] += 1;
-                hi += 1;
-            }
-            while lo < hi && (cls[lo].ts as i64) < s_lo {
-                let c = cls[lo].camp as usize;
-                self.cnt[c] -= 1;
-                if self.cnt[c] == 0 {
-                    let o = self.open[c] as usize;
-                    self.close(c, o, k);
+                if hi > 0 && cls.get_unchecked(hi - 1).ts as i64 >= s as i64 - WEEK_MS {
+                    let t = cls.get_unchecked(hi - 1).ts;
+                    let mut q = hi - 1;
+                    while q > 0 && cls.get_unchecked(q - 1).ts == t {
+                        q -= 1;
+                    }
+                    cls.get_unchecked(q).camp as usize
+                } else {
+                    organic
                 }
-                lo += 1;
-            }
-            let credited = if hi > lo {
-                let t = cls[hi - 1].ts;
-                let mut q = hi - 1;
-                while q > lo && cls[q - 1].ts == t {
-                    q -= 1;
-                }
-                cls[q].camp as usize
-            } else {
-                organic
             };
-            let rev = self.sess_rev[k];
-            let st = unsafe {
-                self.cstat.get_unchecked_mut(credited * self.nd + (self.sess_day[k] - self.dshift) as usize)
-            };
-            st.sessions += 1;
-            st.purchasing += (rev > 0) as u32;
-            st.revenue += rev;
+            let key = credited * nd + (se.day - dshift) as usize;
+            if key != a_key {
+                if a_sess != 0 {
+                    let st = unsafe { self.cstat.get_unchecked_mut(a_key) };
+                    st.sessions += a_sess;
+                    st.purchasing += a_purch;
+                    st.revenue += a_rev;
+                }
+                a_key = key;
+                a_sess = 0;
+                a_purch = 0;
+                a_rev = 0;
+            }
+            a_sess += 1;
+            a_purch += (se.rev > 0) as u32;
+            a_rev += se.rev;
         }
-        if !self.touched.is_empty() {
-            let touched = std::mem::take(&mut self.touched);
-            for &c in &touched {
-                let c = c as usize;
-                if self.cnt[c] > 0 {
-                    let o = self.open[c] as usize;
-                    self.close(c, o, s_n);
-                    self.cnt[c] = 0;
-                }
-            }
-            self.touched = touched;
-            self.touched.clear();
+        if a_sess != 0 {
+            let st = unsafe { self.cstat.get_unchecked_mut(a_key) };
+            st.sessions += a_sess;
+            st.purchasing += a_purch;
+            st.revenue += a_rev;
         }
     }
+}
 
-    fn emit_row(&mut self, name: u64, day: u32, sessions: u32, events: u32, revenue: u64, cat_touched: bool, base_day_off: i64) {
-        let mut top = u32::MAX;
-        if cat_touched {
-            let mut best = 0u64;
-            for c in 0..self.ncat {
-                let v = self.catrev[c];
-                if v > best {
-                    best = v;
-                    top = c as u32;
+/// Partitions with at least this many clicks sort them by radix (see Worker::partition).
+const CL_RADIX_MIN: usize = 512;
+
+#[inline(always)]
+fn click_less(a: &ClC, b: &ClC) -> bool {
+    a.ts < b.ts || (a.ts == b.ts && sget(a.cid) < sget(b.cid))
+}
+
+/// Finish the (ts, click_id bytes) order of one person's nearly sorted clicks: insertion with a
+/// small step budget, and the general sort when an element is far from its place.
+#[inline]
+fn fix_clicks(cls: &mut [ClC]) {
+    for i in 1..cls.len() {
+        if click_less(&cls[i], &cls[i - 1]) {
+            let x = cls[i];
+            let mut j = i;
+            let mut steps = 0;
+            while j > 0 && click_less(&x, &cls[j - 1]) {
+                if steps == 16 {
+                    cls[j] = x;
+                    cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
+                    return;
                 }
-                self.catrev[c] = 0;
+                cls[j] = cls[j - 1];
+                j -= 1;
+                steps += 1;
             }
+            cls[j] = x;
         }
-        self.rows.push(UserRow { name, day: (base_day_off + day as i64) as i32, sessions, events, revenue, top });
     }
+}
+
+/// Sort one person's clicks by (ts, click_id bytes). Click ids are unique after dedup, so the
+/// order is total. Small inputs: branch-free rank sort on ts (rank = number of smaller ts);
+/// equal ts values (rare) collide on a rank and take the general path.
+#[inline]
+fn sort_clicks(cls: &mut [ClC]) {
+    const SMALL: usize = 64;
+    let n = cls.len();
+    if n < 2 {
+        return;
+    }
+    if n <= SMALL {
+        let mut ts = [std::mem::MaybeUninit::<u32>::uninit(); SMALL];
+        let mut tmp = [std::mem::MaybeUninit::<ClC>::uninit(); SMALL];
+        let m = (n + 7) & !7;
+        for i in 0..n {
+            ts[i].write(cls[i].ts);
+            tmp[i].write(cls[i]);
+        }
+        for i in n..m {
+            ts[i].write(u32::MAX); // never smaller than a real ts
+        }
+        // SAFETY: the first m (<= SMALL) entries of ts and the first n of tmp are initialised
+        let ts: &[u32] = unsafe { std::slice::from_raw_parts(ts.as_ptr() as *const u32, m) };
+        let tmp: &[ClC] = unsafe { std::slice::from_raw_parts(tmp.as_ptr() as *const ClC, n) };
+        let mut used = 0u64;
+        for i in 0..n {
+            let t = ts[i];
+            let mut r = 0u32;
+            for ch in ts.chunks_exact(8) {
+                for &x in ch {
+                    r += (x < t) as u32;
+                }
+            }
+            // r < n: at most n - 1 entries are smaller
+            used |= 1u64 << r;
+            unsafe { *cls.get_unchecked_mut(r as usize) = tmp[i] };
+        }
+        if used.count_ones() as usize == n {
+            return; // all ranks distinct: a permutation, sorted by ts
+        }
+        cls.copy_from_slice(tmp);
+    }
+    cls.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| sget(a.cid).cmp(sget(b.cid))));
 }
 
 /// Sort u64 keys: insertion sort for small, radix (by the high 32 bits) for large.
