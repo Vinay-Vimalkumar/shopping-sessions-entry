@@ -6,22 +6,31 @@ binary that implements `rules.md` exactly: it reads `/data`, and writes
 
 How it works:
 
-1. All CSV files are memory-mapped and split into line-aligned chunks. Worker threads find line
-   and field boundaries 64 bytes at a time with AVX2 comma/newline/quote bitmasks, and check the
-   quoting rules with a popcount; timestamps use a small month table plus SWAR digit decoding,
-   with exact slow paths for anything unusual.
+1. All CSV files are memory-mapped and split into line-aligned chunks that worker threads (one per
+   CPU, pinned) pull from a shared counter. Each line's field boundaries come from AVX2
+   comma/newline/quote bitmasks over two 64-byte windows (BMI2 `pdep`/`pext` to pick the commas,
+   quote placement checked with mask arithmetic); unusual lines take an exact scalar path.
+   Timestamps use a small table of the months around the window plus SWAR digit decoding, with
+   exact slow paths for anything unusual. The input is software-prefetched 1 KB ahead.
 2. Every user ID is interned once during parsing into a concurrent lock-free table (dense indices,
-   prefetched lookups). Link files are parsed first; one thread runs a prefetching union-find over
-   the dense indices (each person named by its byte-wise smallest ID) while the others parse.
-3. Events are scattered into 512 partitions by a 128-bit `event_id` hash (64-bit key, partition
-   from independent bits) into per-thread arenas; each partition is deduplicated with a
-   cache-resident open-addressing table (smallest `ingest_ts` wins, before validation).
-4. Surviving events and valid clicks are scattered into person partitions; each partition groups
-   rows per person with a counting sort, then sessionizes and attributes with a sliding 7-day
-   click window (credit: latest click, ties by smallest `click_id`; assists counted per campaign
-   activity interval, split by day).
-5. A minimal built-in Parquet writer (PLAIN, uncompressed) writes one user_daily file per thread.
-6. Big buffers use huge pages; memory and input mappings are released in parallel before `_exit`.
+   lookups prefetched 16 rows ahead). Link files are parsed first; one thread runs a prefetching
+   union-find over the dense indices (each person named by its byte-wise smallest ID) while the
+   others parse events and clicks.
+3. Events become 24-byte records scattered by a 128-bit `event_id` hash (64-bit key, partition
+   from independent bits) into cache-sized partitions (about 12K rows), through write-combining
+   staging buffers flushed with non-temporal stores. Each partition is deduplicated with a
+   generation-tagged open-addressing table (smallest `ingest_ts` wins, before validation; invalid
+   copies are kept as tombstones).
+4. Surviving events and valid clicks are scattered into person-range partitions. Each partition
+   groups rows per person with a counting sort. Sessions come from 30-minute cells (first, last,
+   count, revenue per cell; a session can only break between non-empty cells), so events are never
+   sorted. Clicks are ordered by (ts, click_id bytes) with a radix pass plus a bounded repair.
+   Credit is the latest click within 7 days (ties: smallest `click_id`); assists are index ranges
+   of sessions per click, merged per campaign, split by day.
+5. A minimal streaming Parquet writer (uncompressed, INT32 counts, dictionary-encoded
+   `top_category`) writes one user_daily file per worker as soon as that worker finishes.
+6. Big buffers come from mmap with transparent huge pages requested; memory and input mappings
+   are released in parallel before `_exit`.
 
 Open-source libraries used: `memmap2`, `memchr`, `xxhash-rust`, `libc` (all MIT/Apache-2.0).
 All other code was written by our team during the buildathon.

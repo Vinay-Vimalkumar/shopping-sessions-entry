@@ -6,3 +6,4 @@ target-v3/
 target-r8/
 target-r32/
 target-ovf/
+target-*/
