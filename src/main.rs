@@ -97,15 +97,13 @@ mod halloc {
 #[global_allocator]
 static GA: halloc::HugeAlloc = halloc::HugeAlloc;
 
-/// Records staged per partition before a write-combined flush (default; `W` on `PartBuf`).
-/// `W * size_of::<T>()` should be a multiple of 64 so every flush writes whole cache lines:
-/// a partly written line is evicted from the write-combining buffers by the other streams.
+/// Records staged per partition before a write-combined flush.
 const WK: usize = 8;
 
 /// Per-thread partitioned buffer: one big allocation, fixed capacity per partition, overflow Vecs.
 /// Pushes are staged WK at a time in a small cache-resident buffer and flushed as whole cache
 /// lines (non-temporal stores on Linux/AVX2 builds), so scattering does not stall on misses.
-struct PartBuf<T: Copy, const W: usize = WK> {
+struct PartBuf<T: Copy> {
     mem: Vec<T>,
     cap: usize,
     lens: Vec<u32>,
@@ -127,19 +125,19 @@ unsafe fn nt_copy(src: *const u8, dst: *mut u8, bytes: usize) {
     }
 }
 
-impl<T: Copy, const W: usize> PartBuf<T, W> {
+impl<T: Copy> PartBuf<T> {
     fn new(nparts: usize, cap: usize) -> Self {
-        let cap = (cap + W - 1) / W * W;
+        let cap = (cap + WK - 1) / WK * WK;
         let mem: Vec<T> = Vec::with_capacity(nparts * cap);
         let nt = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
-            && (mem.as_ptr() as usize) % 64 == 0
-            && (std::mem::size_of::<T>() * W) % 32 == 0;
+            && (mem.as_ptr() as usize) % 32 == 0
+            && (std::mem::size_of::<T>() * WK) % 32 == 0;
         PartBuf {
             mem,
             cap,
             lens: vec![0; nparts],
             over: (0..nparts).map(|_| Vec::new()).collect(),
-            stage: Vec::with_capacity(nparts * W),
+            stage: Vec::with_capacity(nparts * WK),
             slen: vec![0; nparts],
             nt,
         }
@@ -148,24 +146,9 @@ impl<T: Copy, const W: usize> PartBuf<T, W> {
     fn push(&mut self, p: usize, v: T) {
         unsafe {
             let n = *self.slen.get_unchecked(p) as usize;
-            self.stage.as_mut_ptr().add(p * W + n).write(v);
-            if n + 1 < W {
+            self.stage.as_mut_ptr().add(p * WK + n).write(v);
+            if n + 1 < WK {
                 *self.slen.get_unchecked_mut(p) = (n + 1) as u32;
-            } else {
-                *self.slen.get_unchecked_mut(p) = 0;
-                self.flush_full(p);
-            }
-        }
-    }
-    /// Branch-free conditional push: the record is always staged, but only kept if `keep`.
-    #[inline(always)]
-    fn push_if(&mut self, p: usize, v: T, keep: bool) {
-        unsafe {
-            let n = *self.slen.get_unchecked(p) as usize;
-            self.stage.as_mut_ptr().add(p * W + n).write(v);
-            let n2 = n + keep as usize;
-            if n2 < W {
-                *self.slen.get_unchecked_mut(p) = n2 as u32;
             } else {
                 *self.slen.get_unchecked_mut(p) = 0;
                 self.flush_full(p);
@@ -175,22 +158,22 @@ impl<T: Copy, const W: usize> PartBuf<T, W> {
     #[inline(always)]
     unsafe fn flush_full(&mut self, p: usize) {
         let l = *self.lens.get_unchecked(p) as usize;
-        let src = self.stage.as_ptr().add(p * W);
-        if l + W <= self.cap {
+        let src = self.stage.as_ptr().add(p * WK);
+        if l + WK <= self.cap {
             let dst = self.mem.as_mut_ptr().add(p * self.cap + l);
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             {
                 if self.nt {
-                    nt_copy(src as *const u8, dst as *mut u8, W * std::mem::size_of::<T>());
+                    nt_copy(src as *const u8, dst as *mut u8, WK * std::mem::size_of::<T>());
                 } else {
-                    std::ptr::copy_nonoverlapping(src, dst, W);
+                    std::ptr::copy_nonoverlapping(src, dst, WK);
                 }
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            std::ptr::copy_nonoverlapping(src, dst, W);
-            *self.lens.get_unchecked_mut(p) = (l + W) as u32;
+            std::ptr::copy_nonoverlapping(src, dst, WK);
+            *self.lens.get_unchecked_mut(p) = (l + WK) as u32;
         } else {
-            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src, W));
+            self.over.get_unchecked_mut(p).extend_from_slice(std::slice::from_raw_parts(src, WK));
         }
     }
     /// Flush staged records; must be called before reading.
@@ -202,7 +185,7 @@ impl<T: Copy, const W: usize> PartBuf<T, W> {
                     continue;
                 }
                 let l = self.lens[p] as usize;
-                let src = self.stage.as_ptr().add(p * W);
+                let src = self.stage.as_ptr().add(p * WK);
                 if l + n <= self.cap {
                     std::ptr::copy_nonoverlapping(src, self.mem.as_mut_ptr().add(p * self.cap + l), n);
                     self.lens[p] = (l + n) as u32;
@@ -226,6 +209,148 @@ impl<T: Copy, const W: usize> PartBuf<T, W> {
     }
     fn len(&self, p: usize) -> usize {
         self.lens[p] as usize + self.over[p].len()
+    }
+}
+
+/// Bytes per phase-2 output chunk: a multiple of 192, so chunks hold whole flushes of both
+/// output record types and every flush is whole cache lines.
+const CHUNK: usize = 7680;
+const SLAB: usize = 2 << 20;
+
+/// Chunk memory for phase-2 output. Regions of the phase-1 buffers are handed over once they
+/// have been fully read (they are already faulted in); fresh slabs cover the start-up.
+struct Pool {
+    free: Vec<(*mut u8, usize)>,
+    slabs: Vec<Vec<u8>>,
+}
+unsafe impl Send for Pool {}
+
+impl Pool {
+    fn new() -> Self {
+        Pool { free: Vec::new(), slabs: Vec::new() }
+    }
+    /// Hand over `bytes` at `p`; the caller guarantees nobody reads or writes them any more
+    /// and that they stay allocated for as long as the chunks are used.
+    fn give(&mut self, p: *mut u8, bytes: usize) {
+        let a = (p as usize + 63) & !63;
+        let pad = a - p as usize;
+        if bytes >= pad + CHUNK {
+            self.free.push((a as *mut u8, bytes - pad));
+        }
+    }
+    /// A 64-byte-aligned chunk of CHUNK bytes (most recently released memory first).
+    #[inline(never)]
+    fn take(&mut self) -> *mut u8 {
+        loop {
+            if let Some(l) = self.free.last_mut() {
+                if l.1 >= CHUNK {
+                    let r = l.0;
+                    l.0 = unsafe { r.add(CHUNK) };
+                    l.1 -= CHUNK;
+                    return r;
+                }
+                self.free.pop();
+                continue;
+            }
+            let mut v: Vec<u8> = Vec::with_capacity(SLAB);
+            let p = v.as_mut_ptr();
+            self.slabs.push(v);
+            self.give(p, SLAB);
+        }
+    }
+}
+
+/// Per-thread partitioned output made of pool chunks; pushes are staged W at a time and
+/// flushed as whole cache lines like `PartBuf`.
+struct ChunkBuf<T: Copy, const W: usize> {
+    stage: Vec<T>,
+    slen: Vec<u32>,
+    cur: Vec<*mut T>,
+    room: Vec<u32>,
+    /// chunks per partition: (start, records); the last one's count is fixed up by `finish`
+    segs: Vec<Vec<(*const T, u32)>>,
+}
+unsafe impl<T: Copy + Send, const W: usize> Send for ChunkBuf<T, W> {}
+unsafe impl<T: Copy + Sync, const W: usize> Sync for ChunkBuf<T, W> {}
+
+impl<T: Copy, const W: usize> ChunkBuf<T, W> {
+    const CH: usize = CHUNK / std::mem::size_of::<T>();
+    fn new(nparts: usize) -> Self {
+        assert!(CHUNK % (W * std::mem::size_of::<T>()) == 0 && (W * std::mem::size_of::<T>()) % 64 == 0);
+        assert!(std::mem::align_of::<T>() <= 64);
+        ChunkBuf {
+            stage: Vec::with_capacity(nparts * W),
+            slen: vec![0; nparts],
+            cur: vec![std::ptr::null_mut(); nparts],
+            room: vec![0; nparts],
+            segs: (0..nparts).map(|_| Vec::new()).collect(),
+        }
+    }
+    /// Branch-free conditional push: the record is always staged, but only kept if `keep`.
+    #[inline(always)]
+    fn push_if(&mut self, pool: &mut Pool, p: usize, v: T, keep: bool) {
+        unsafe {
+            let n = *self.slen.get_unchecked(p) as usize;
+            self.stage.as_mut_ptr().add(p * W + n).write(v);
+            let n2 = n + keep as usize;
+            if n2 < W {
+                *self.slen.get_unchecked_mut(p) = n2 as u32;
+            } else {
+                *self.slen.get_unchecked_mut(p) = 0;
+                self.flush_full(pool, p);
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn open(&mut self, pool: &mut Pool, p: usize) {
+        let c = pool.take() as *mut T;
+        *self.cur.get_unchecked_mut(p) = c;
+        *self.room.get_unchecked_mut(p) = Self::CH as u32;
+        self.segs.get_unchecked_mut(p).push((c as *const T, Self::CH as u32));
+    }
+    #[inline(always)]
+    unsafe fn flush_full(&mut self, pool: &mut Pool, p: usize) {
+        if *self.room.get_unchecked(p) == 0 {
+            self.open(pool, p);
+        }
+        let src = self.stage.as_ptr().add(p * W);
+        let dst = *self.cur.get_unchecked(p);
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        nt_copy(src as *const u8, dst as *mut u8, W * std::mem::size_of::<T>());
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        std::ptr::copy_nonoverlapping(src, dst, W);
+        *self.cur.get_unchecked_mut(p) = dst.add(W);
+        *self.room.get_unchecked_mut(p) -= W as u32;
+    }
+    /// Flush staged records; must be called before reading, and no pushes may follow.
+    fn finish(&mut self, pool: &mut Pool) {
+        unsafe {
+            for p in 0..self.slen.len() {
+                let n = self.slen[p] as usize;
+                if n != 0 {
+                    if self.room[p] == 0 {
+                        self.open(pool, p);
+                    }
+                    std::ptr::copy_nonoverlapping(self.stage.as_ptr().add(p * W), self.cur[p], n);
+                    self.cur[p] = self.cur[p].add(n);
+                    self.room[p] -= n as u32;
+                    self.slen[p] = 0;
+                }
+                let room = self.room[p];
+                if let Some(l) = self.segs[p].last_mut() {
+                    l.1 = Self::CH as u32 - room;
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_sfence();
+        }
+        self.stage = Vec::new();
+    }
+    fn slices(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
+        self.segs[p].iter().map(|&(s, n)| unsafe { std::slice::from_raw_parts(s, n as usize) })
+    }
+    fn len(&self, p: usize) -> usize {
+        self.segs[p].iter().map(|x| x.1 as usize).sum()
     }
 }
 
@@ -2892,11 +3017,11 @@ fn main() {
     let next = AtomicUsize::new(0);
     let total_items = npart + cl_items.len();
     struct P2 {
-        ev: PartBuf<EvB, 16>,
-        cl: PartBuf<ClB>,
+        ev: ChunkBuf<EvB, 16>,
+        cl: ChunkBuf<ClB, 8>,
+        // fresh chunk memory; the other chunks live inside the phase-1 buffers
+        _slabs: Vec<Vec<u8>>,
     }
-    let ev_out_cap = est_ev * 21 / 20 / npart2 / nthreads + 32;
-    let cl_out_cap = est_cl * 11 / 10 / npart2 / nthreads + 32;
     let p2: Vec<P2> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|t| {
@@ -2906,7 +3031,9 @@ fn main() {
                 let next = &next;
                 s.spawn(move || {
                     pin_thread(t);
-                    let mut r = P2 { ev: PartBuf::new(npart2, ev_out_cap), cl: PartBuf::new(npart2, cl_out_cap) };
+                    let mut rev: ChunkBuf<EvB, 16> = ChunkBuf::new(npart2);
+                    let mut rcl: ChunkBuf<ClB, 8> = ChunkBuf::new(npart2);
+                    let mut pool = Pool::new();
                     // Dedup, per event-ID partition:
                     //  1. a 2-bit "seen / seen again" counter filter over the keys; a key that has
                     //     two or more copies always lands every copy on a "seen again" counter
@@ -2974,7 +3101,8 @@ fn main() {
                                     unsafe { cp.add(nc).write(e) };
                                     nc += again as usize;
                                     let person = person_of(parent, e.user);
-                                    r.ev.push_if(
+                                    rev.push_if(
+                                        &mut pool,
                                         (person >> shift2) as usize,
                                         EvB { person, ts: e.ts, meta: e.meta },
                                         (again == 0) & (e.ts != u32::MAX),
@@ -3032,9 +3160,15 @@ fn main() {
                                     }
                                     let e = unsafe { cand.get_unchecked(*win.get_unchecked(k) as usize) };
                                     let person = person_of(parent, e.user);
-                                    r.ev.push((person >> shift2) as usize, EvB { person, ts: e.ts, meta: e.meta });
+                                    rev.push_if(&mut pool, (person >> shift2) as usize, EvB { person, ts: e.ts, meta: e.meta }, true);
                                 }
                                 tadd(7, t_x);
+                            }
+                            // every row of this partition has been read (repeats were copied out):
+                            // its phase-1 memory becomes output chunks
+                            for tt in p1.iter() {
+                                let reg = unsafe { tt.ev.mem.as_ptr().add(p * tt.ev.cap) } as *mut u8;
+                                pool.give(reg, tt.ev.cap * std::mem::size_of::<EvA>());
                             }
                         } else {
                             let t_c = Instant::now();
@@ -3056,25 +3190,31 @@ fn main() {
                                         prefetch(unsafe { parent.as_ptr().add(v[k + 16].user as usize) });
                                     }
                                     let person = person_of(parent, c.user);
-                                    r.cl.push(
+                                    rcl.push_if(
+                                        &mut pool,
                                         (person >> shift2) as usize,
                                         ClB { cid: c.cid, person, ts: c.ts, camp: c.camp, _pad: 0 },
+                                        true,
                                     );
                                 }
+                            }
+                            // this piece has been read: release the part inside the main buffer
+                            if a < cm.len() {
+                                let e = b.min(cm.len());
+                                pool.give(cm[a..e].as_ptr() as *mut u8, (e - a) * std::mem::size_of::<ClA>());
                             }
                             tadd(2, t_c);
                         }
                     }
-                    r.ev.finish();
-                    r.cl.finish();
-                    r
+                    rev.finish(&mut pool);
+                    rcl.finish(&mut pool);
+                    P2 { ev: rev, cl: rcl, _slabs: pool.slabs }
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    log_mem("phase 2 end (p1+p2 live)");
-    par_drop(p1);
+    log_mem("phase 2 end");
     log("phase 2 dedup done");
 
     // ---------------- phase 3: per person partition
@@ -3119,10 +3259,8 @@ fn main() {
                         evp.clear();
                         clp.clear();
                         for t in p2.iter() {
-                            evp.push(t.ev.main(q));
-                            evp.push(t.ev.over(q));
-                            clp.push(t.cl.main(q));
-                            clp.push(t.cl.over(q));
+                            evp.extend(t.ev.slices(q));
+                            clp.extend(t.cl.slices(q));
                         }
                         let qbase = (q << shift2) as u32;
                         let qsize = 1usize << shift2;
@@ -3147,6 +3285,8 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     par_drop(p2);
+    // only now: phase-2 output chunks live inside the phase-1 buffers
+    par_drop(p1);
     log("phase 3 sessions done");
     log(&format!(
         "cpu ms: dedup-filter {:.0}, dedup-emit {:.0}, dedup-exact {:.0}, clicks-map {:.0}, group {:.0}, persons {:.0} (cells {:.0}, attrib {:.0})",
