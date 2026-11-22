@@ -3026,6 +3026,12 @@ fn main() {
     let psize: Vec<usize> = (0..npart2).map(|q| p2.iter().map(|t| t.ev.len(q)).sum()).collect();
     order.sort_unstable_by(|a, b| psize[*b].cmp(&psize[*a]));
     let next = AtomicUsize::new(0);
+    // each worker writes its own user_daily file as soon as its partitions are done, so the
+    // writing overlaps the other workers' tail of phase 3
+    let ud = out_dir.join("user_daily");
+    let cd = out_dir.join("campaign_daily");
+    let _ = fs::create_dir_all(&ud);
+    let _ = fs::create_dir_all(&cd);
     let workers: Vec<Worker> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|t| {
@@ -3033,6 +3039,8 @@ fn main() {
                 let next = &next;
                 let ut = &ut;
                 let order = &order;
+                let ud = &ud;
+                let cats = &cats;
                 s.spawn(move || {
                     pin_thread(t);
                     let mut w = Worker::new(ncamp, ndays, ncat);
@@ -3059,6 +3067,17 @@ fn main() {
                         w.partition(&evp, &clp, qbase, qsize, base, base_day_off, organic, ut);
                     }
                     w.finalize_stats();
+                    let rows = &w.rows;
+                    if !rows.is_empty() || t == 0 {
+                        let mut f = pq::Writer::new(rows.len(), rows.len() * 48 + 1024);
+                        f.str_col("user_id", rows.iter().map(|r| sget(r.name)));
+                        f.date_col("day", rows.iter().map(|r| r.day));
+                        f.i32_col("sessions", rows.iter().map(|r| r.sessions as i32));
+                        f.i32_col("events", rows.iter().map(|r| r.events as i32));
+                        f.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
+                        f.dict_col("top_category", cats, rows.iter().map(|r| r.top));
+                        fs::write(ud.join(format!("part-{t:03}.parquet")), f.finish()).expect("write user_daily");
+                    }
                     w
                 })
             })
@@ -3078,12 +3097,7 @@ fn main() {
         TACC[6].load(Ordering::Relaxed) as f64 / 1e6
     ));
 
-    // ---------------- phase 4: write
-    let ud = out_dir.join("user_daily");
-    let cd = out_dir.join("campaign_daily");
-    let _ = fs::create_dir_all(&ud);
-    let _ = fs::create_dir_all(&cd);
-
+    // ---------------- phase 4: write campaign_daily (user_daily was written by the phase 3 workers)
     let mut stats = vec![[0u64; 4]; (ncamp + 1) * ndays];
     for w in &workers {
         for (a, b) in stats.iter_mut().zip(w.stats.iter()) {
@@ -3093,25 +3107,7 @@ fn main() {
             a[3] += b[3];
         }
     }
-    std::thread::scope(|s| {
-        for (wi, w) in workers.iter().enumerate() {
-            let ud = &ud;
-            let cats = &cats;
-            s.spawn(move || {
-                let rows = &w.rows;
-                if rows.is_empty() && wi != 0 {
-                    return;
-                }
-                let mut f = pq::Writer::new(rows.len(), rows.len() * 48 + 1024);
-                f.str_col("user_id", rows.iter().map(|r| sget(r.name)));
-                f.date_col("day", rows.iter().map(|r| r.day));
-                f.i32_col("sessions", rows.iter().map(|r| r.sessions as i32));
-                f.i32_col("events", rows.iter().map(|r| r.events as i32));
-                f.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
-                f.dict_col("top_category", cats, rows.iter().map(|r| r.top));
-                fs::write(ud.join(format!("part-{wi:03}.parquet")), f.finish()).expect("write user_daily");
-            });
-        }
+    {
         // (campaign_id, channel, day, [sessions, purchasing, revenue, assisted])
         let mut crows: Vec<(&[u8], &[u8], i32, [u64; 4])> = Vec::new();
         for c in 0..=ncamp {
@@ -3138,7 +3134,7 @@ fn main() {
         f.i64_col("revenue_cents", crows.iter().map(|r| r.3[2] as i64));
         f.i32_col("assisted_sessions", crows.iter().map(|r| r.3[3] as i32));
         fs::write(cd.join("part-000.parquet"), f.finish()).expect("write campaign_daily");
-    });
+    }
     log("phase 4 write done");
     par_drop(workers);
     log("released");
