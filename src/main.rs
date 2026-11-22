@@ -1937,7 +1937,8 @@ impl UTab {
     }
 }
 
-/// A parsed link line: both side hashes and string refs.
+/// A parsed link line waiting for its user-table slots: both side hashes, string refs and
+/// leading-bytes keys.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LinkRec {
@@ -1945,47 +1946,89 @@ struct LinkRec {
     hb: u64,
     a: u64,
     b: u64,
+    ka: u64,
+    kb: u64,
+}
+
+/// A link as user indices, with the first 8 bytes of each ID (big-endian, zero padded) so the
+/// union-find orders most names without touching their text.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Edge {
+    a: u32,
+    b: u32,
+    ka: u64,
+    kb: u64,
 }
 
 #[inline(always)]
 fn key8(s: &[u8]) -> u64 {
+    if s.len() >= 8 {
+        return u64::from_be(unsafe { std::ptr::read_unaligned(s.as_ptr() as *const u64) });
+    }
     let mut buf = [0u8; 8];
-    let n = s.len().min(8);
-    buf[..n].copy_from_slice(&s[..n]);
+    buf[..s.len()].copy_from_slice(s);
     u64::from_be_bytes(buf)
 }
 
-#[inline(always)]
-fn link_fields(f: &[&'static [u8]; 2], out: &mut Vec<LinkRec>) {
-    let (a, b) = (f[0], f[1]);
-    if a.is_empty() || b.is_empty() {
-        return;
-    }
-    out.push(LinkRec { ha: nz(xxh3_64(a)), hb: nz(xxh3_64(b)), a: sref(a), b: sref(b) });
+const LRING: usize = 16;
+
+/// Per-chunk link pipeline: a parsed line prefetches its two user-table slots and is interned
+/// LRING lines later.
+struct LinkSt {
+    ring: [LinkRec; LRING],
+    pos: usize,
+    edges: Vec<Edge>,
 }
 
-/// Intern both sides of every link line; returns user-index edges.
-fn intern_links(recs: &[LinkRec], ut: &UTab, a: &mut IdxAlloc) -> Vec<(u32, u32)> {
-    let mut edges = Vec::with_capacity(recs.len());
-    let n = recs.len();
-    for i in 0..n {
-        if i + 8 < n {
-            prefetch(ut.slot_ptr(recs[i + 8].ha));
-            prefetch(ut.slot_ptr(recs[i + 8].hb));
-        }
-        let r = recs[i];
-        let ua = ut.get_or_insert(r.ha, r.a, a);
-        let ub = ut.get_or_insert(r.hb, r.b, a);
-        edges.push((ua, ub));
+impl LinkSt {
+    fn new(cap: usize) -> Self {
+        LinkSt { ring: [LinkRec { ha: 0, hb: 0, a: 0, b: 0, ka: 0, kb: 0 }; LRING], pos: 0, edges: Vec::with_capacity(cap) }
     }
-    edges
+    #[inline(always)]
+    fn resolve(&mut self, i: usize, ut: &UTab, al: &mut IdxAlloc) {
+        let r = self.ring[i];
+        let ua = ut.get_or_insert(r.ha, r.a, al);
+        let ub = ut.get_or_insert(r.hb, r.b, al);
+        self.edges.push(Edge { a: ua, b: ub, ka: r.ka, kb: r.kb });
+    }
+    #[inline(always)]
+    fn line(&mut self, f: &[&'static [u8]; 2], ut: &UTab, al: &mut IdxAlloc) {
+        let (a, b) = (f[0], f[1]);
+        if a.is_empty() || b.is_empty() {
+            return;
+        }
+        let ha = nz(xxh3_64(a));
+        let hb = nz(xxh3_64(b));
+        prefetch(ut.slot_ptr(ha));
+        prefetch(ut.slot_ptr(hb));
+        let i = self.pos & (LRING - 1);
+        if self.pos >= LRING {
+            self.resolve(i, ut, al);
+        }
+        self.ring[i] = LinkRec { ha, hb, a: sref(a), b: sref(b), ka: key8(a), kb: key8(b) };
+        self.pos += 1;
+    }
+    /// Intern the lines still in the ring, in line order, and hand back the chunk's edges.
+    fn finish(mut self, ut: &UTab, al: &mut IdxAlloc) -> Vec<Edge> {
+        let n = self.pos.min(LRING);
+        for k in 0..n {
+            let i = (self.pos - n + k) & (LRING - 1);
+            self.resolve(i, ut, al);
+        }
+        self.edges
+    }
 }
 
 /// Union-find over user indices. parent[u] = 0 for a root (and for every user in no link),
 /// else root + 1 (flattened). Each root is the byte-wise smallest ID of its person.
-fn build_dsu(edges: &[Vec<(u32, u32)>], ut: &UTab, cap_users: usize) -> Vec<u32> {
+/// `n_linked` bounds the user indices that can appear in an edge.
+fn build_dsu(edges: &[Vec<Edge>], ut: &UTab, cap_users: usize, n_linked: usize) -> Vec<u32> {
     let mut parent: Vec<u32> = zeroed_vec(cap_users);
-    let mut nkey: Vec<u64> = zeroed_vec(cap_users); // key8 + 1 (0 = not computed)
+    let n_linked = n_linked.min(cap_users);
+    // key8 of every root that has absorbed another ID; a root that has not is an endpoint of
+    // the edge at hand, which carries its key
+    let mut rkey: Vec<u64> = zeroed_vec(n_linked);
     #[inline(always)]
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         unsafe {
@@ -2003,50 +2046,66 @@ fn build_dsu(edges: &[Vec<(u32, u32)>], ut: &UTab, cap_users: usize) -> Vec<u32>
             }
         }
     }
-    let mut key = |nkey: &mut Vec<u64>, i: u32| -> u64 {
-        let k = nkey[i as usize];
-        if k != 0 {
-            return k;
-        }
-        let k = key8(sget(ut.name(i))).wrapping_add(1);
-        nkey[i as usize] = k;
-        k
-    };
+    let mut total = 0usize;
     for v in edges {
         let m = v.len();
+        total += m;
         for i in 0..m {
+            // two-stage prefetch: the endpoints' entries 16 edges ahead, their parents' 8 ahead
+            if i + 16 < m {
+                let e = v[i + 16];
+                prefetch(unsafe { parent.as_ptr().add(e.a as usize) });
+                prefetch(unsafe { parent.as_ptr().add(e.b as usize) });
+            }
             if i + 8 < m {
-                let (a, b) = v[i + 8];
-                prefetch(unsafe { parent.as_ptr().add(a as usize) });
-                prefetch(unsafe { parent.as_ptr().add(b as usize) });
+                let e = v[i + 8];
+                // an entry is 0 (prefetches slot 0, harmless) or root/parent + 1
+                let pa = parent[e.a as usize] as usize;
+                let pb = parent[e.b as usize] as usize;
+                prefetch(unsafe { parent.as_ptr().add(pa.saturating_sub(1)) });
+                prefetch(unsafe { parent.as_ptr().add(pb.saturating_sub(1)) });
             }
-            let (a, b) = v[i];
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
+            let e = v[i];
+            let ra = find(&mut parent, e.a);
+            let rb = find(&mut parent, e.b);
             if ra != rb {
-                let ka = key(&mut nkey, ra);
-                let kb = key(&mut nkey, rb);
+                let ka = if ra == e.a { e.ka } else { rkey[ra as usize] };
+                let kb = if rb == e.b { e.kb } else { rkey[rb as usize] };
                 let a_smaller = if ka != kb { ka < kb } else { sget(ut.name(ra)) < sget(ut.name(rb)) };
-                if a_smaller {
-                    parent[rb as usize] = ra + 1;
-                } else {
-                    parent[ra as usize] = rb + 1;
-                }
+                // which side wins is a coin flip: select, don't branch
+                let (win, lose, kw) = if a_smaller { (ra, rb, ka) } else { (rb, ra, kb) };
+                parent[lose as usize] = win + 1;
+                rkey[win as usize] = kw;
             }
         }
     }
-    // flatten
-    for v in edges {
-        for &(a, b) in v.iter() {
-            for u in [a, b] {
+    // flatten: in index order when the linked users are dense, else by edge endpoint
+    if n_linked <= total.saturating_mul(8) {
+        for u in 0..n_linked as u32 {
+            if (u as usize) + 16 < n_linked {
+                let q = parent[u as usize + 16] as usize;
+                prefetch(unsafe { parent.as_ptr().add(q.saturating_sub(1)) });
+            }
+            // most entries are roots or already point at one; both cases fall through untaken
+            let p = parent[u as usize];
+            let g = parent[p.max(1) as usize - 1];
+            if (g != 0) & (p != 0) {
                 let r = find(&mut parent, u);
-                if r != u {
-                    parent[u as usize] = r + 1;
+                parent[u as usize] = r + 1;
+            }
+        }
+    } else {
+        for v in edges {
+            for e in v.iter() {
+                for u in [e.a, e.b] {
+                    let r = find(&mut parent, u);
+                    if r != u {
+                        parent[u as usize] = r + 1;
+                    }
                 }
             }
         }
     }
-    drop(nkey);
     parent
 }
 
@@ -3057,7 +3116,7 @@ fn main() {
     let parent_cell: OnceLock<Vec<u32>> = OnceLock::new();
     let lnext = AtomicUsize::new(0);
     let ldone = AtomicUsize::new(0);
-    let ledges: Mutex<Vec<(usize, Vec<(u32, u32)>)>> = Mutex::new(Vec::new());
+    let ledges: Mutex<Vec<(usize, Vec<Edge>)>> = Mutex::new(Vec::new());
     #[cfg(target_arch = "x86_64")]
     let use_simd = std::env::var_os("SS_NOSIMD").is_none() && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2");
     #[cfg(not(target_arch = "x86_64"))]
@@ -3089,22 +3148,23 @@ fn main() {
                         }
                         let c: Chunk = lchunks[i];
                         let data = c.data;
-                        let mut v: Vec<LinkRec> = Vec::with_capacity((c.end - c.start) / 24 + 16);
+                        let mut ls = LinkSt::new((c.end - c.start) / 24 + 16);
                         if use_simd {
                             #[cfg(target_arch = "x86_64")]
                             unsafe {
-                                let mut cb = |f: &[&'static [u8]; 2]| link_fields(f, &mut v);
+                                let al = &mut st.alloc;
+                                let mut cb = |f: &[&'static [u8]; 2]| ls.line(f, ut, al);
                                 scan_fields_px::<2, _>(data, c.start, c.end, &mut cb);
                             }
                         } else {
                             for_lines(data, c.start, c.end, |l| {
                                 let mut f: [&'static [u8]; 2] = [&[]; 2];
                                 if split_fields(l, &mut f) {
-                                    link_fields(&f, &mut v);
+                                    ls.line(&f, ut, &mut st.alloc);
                                 }
                             });
                         }
-                        let e = intern_links(&v, ut, &mut st.alloc);
+                        let e = ls.finish(ut, &mut st.alloc);
                         ledges.lock().unwrap().push((i, e));
                         ldone.fetch_add(1, Ordering::Release);
                     }
@@ -3114,9 +3174,11 @@ fn main() {
                         }
                         let mut all = std::mem::take(&mut *ledges.lock().unwrap());
                         all.sort_by_key(|x| x.0);
-                        let edges: Vec<Vec<(u32, u32)>> = all.into_iter().map(|x| x.1).collect();
+                        let edges: Vec<Vec<Edge>> = all.into_iter().map(|x| x.1).collect();
+                        // every link chunk is interned, so no linked user has a higher index
+                        let n_linked = ut.n_users();
                         log("links interned");
-                        let parent = build_dsu(&edges, ut, cap_users);
+                        let parent = build_dsu(&edges, ut, cap_users, n_linked);
                         log("links done");
                         let _ = parent_cell.set(parent);
                     }
