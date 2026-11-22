@@ -109,18 +109,60 @@ struct ChunkMeta {
     data_offset: i64,
 }
 
-pub struct Writer {
+pub struct Writer<'a> {
     out: Vec<u8>,
     rows: usize,
     metas: Vec<ChunkMeta>,
+    /// caller-owned page bodies spliced into the file: (position in `out`, bytes)
+    segs: Vec<(usize, &'a [u8])>,
+    ext: usize, // total length of segs
 }
 
-impl Writer {
+/// Bytes of a plain little-endian column (the PLAIN encoding of INT32 / INT64 on x86).
+pub fn le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+impl<'a> Writer<'a> {
+    /// File offset of the next byte.
+    fn pos(&self) -> usize {
+        self.out.len() + self.ext
+    }
+
+    /// Required column whose PLAIN-encoded page body the caller already holds (`kind`: 0 UTF8
+    /// with 4-byte length prefixes, 1 DATE, 2 INT32, 3 INT64). The body is not copied; write
+    /// the file with `finish_parts`.
+    pub fn raw_col(&mut self, name: &'static str, kind: u8, page: &'a [u8]) {
+        let kind = match kind {
+            0 => Kind::Str,
+            1 => Kind::Date,
+            2 => Kind::I32,
+            _ => Kind::I64,
+        };
+        match kind {
+            Kind::Date | Kind::I32 => assert_eq!(page.len(), self.rows * 4),
+            Kind::I64 => assert_eq!(page.len(), self.rows * 8),
+            _ => {}
+        }
+        let offset = self.pos();
+        self.data_page_header(page.len(), 0);
+        self.segs.push((self.out.len(), page));
+        self.ext += page.len();
+        self.push_meta(name, kind, offset, offset);
+    }
+
+    /// Append the footer and return the file as a sequence of pieces to write in order.
+    pub fn finish_parts(mut self) -> (Vec<u8>, Vec<(usize, &'a [u8])>) {
+        let segs = std::mem::take(&mut self.segs);
+        self.ext = 0;
+        (self.finish(), segs)
+    }
+
     /// `rows` is the row count of every column; `cap` a capacity hint in bytes.
     pub fn new(rows: usize, cap: usize) -> Self {
         let mut out: Vec<u8> = Vec::with_capacity(cap.max(1 << 10));
         out.extend_from_slice(b"PAR1");
-        Writer { out, rows, metas: Vec::new() }
+        Writer { out, rows, metas: Vec::new(), segs: Vec::new(), ext: 0 }
     }
 
     fn data_page_header(&mut self, page_len: usize, encoding: i32) {
@@ -142,7 +184,7 @@ impl Writer {
         self.metas.push(ChunkMeta {
             name,
             kind,
-            size: (self.out.len() - offset) as i64,
+            size: (self.pos() - offset) as i64,
             offset: offset as i64,
             data_offset: data_offset as i64,
         });
@@ -154,7 +196,7 @@ impl Writer {
         I: Iterator<Item = &'s [u8]> + Clone,
     {
         let page_len: usize = it.clone().map(|s| s.len() + 4).sum();
-        let offset = self.out.len();
+        let offset = self.pos();
         self.out.reserve(page_len + 64);
         self.data_page_header(page_len, 0);
         let start = self.out.len();
@@ -171,7 +213,7 @@ impl Writer {
 
     fn i32_any<I: Iterator<Item = i32>>(&mut self, name: &'static str, kind: Kind, it: I) {
         let page_len = self.rows * 4;
-        let offset = self.out.len();
+        let offset = self.pos();
         self.out.reserve(page_len + 64);
         self.data_page_header(page_len, 0);
         let start = self.out.len();
@@ -198,7 +240,7 @@ impl Writer {
     /// Required INT64 column.
     pub fn i64_col<I: Iterator<Item = i64>>(&mut self, name: &'static str, it: I) {
         let page_len = self.rows * 8;
-        let offset = self.out.len();
+        let offset = self.pos();
         self.out.reserve(page_len + 64);
         self.data_page_header(page_len, 0);
         let start = self.out.len();
@@ -219,7 +261,7 @@ impl Writer {
         I: Iterator<Item = u32> + Clone,
     {
         let rows = self.rows;
-        let offset = self.out.len();
+        let offset = self.pos();
         // dictionary page (PLAIN)
         let dict_len: usize = dict.iter().map(|s| s.len() + 4).sum();
         {
@@ -252,7 +294,7 @@ impl Writer {
         }
         let def_len = dhdr.len() + dgroups;
         let page_len = 4 + def_len + ihdr.len() + igroups * bw;
-        let data_offset = self.out.len();
+        let data_offset = self.pos();
         self.out.reserve(page_len + 64);
         self.data_page_header(page_len, 8); // RLE_DICTIONARY
         self.out.extend_from_slice(&(def_len as u32).to_le_bytes());
@@ -293,7 +335,8 @@ impl Writer {
 
     /// Append the footer and return the complete Parquet file.
     pub fn finish(self) -> Vec<u8> {
-        let Writer { mut out, rows, metas } = self;
+        let Writer { mut out, rows, metas, segs, ext: _ } = self;
+        assert!(segs.is_empty(), "raw columns need finish_parts");
         let meta_start = out.len();
         {
             let mut t = Thrift::new(&mut out);

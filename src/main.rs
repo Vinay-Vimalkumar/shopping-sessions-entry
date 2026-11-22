@@ -4,6 +4,7 @@
 mod pq;
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1971,13 +1972,16 @@ fn person_of(parent: &[u32], u: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------- per-person processing
-struct UserRow {
-    name: u64,
-    day: i32,
-    sessions: u32,
-    events: u32,
-    revenue: u64,
-    top: u32, // u32::MAX = null
+/// user_daily rows, stored as the PLAIN-encoded Parquet page bodies of their columns so the
+/// file is written without a separate encode pass.
+#[derive(Default)]
+struct UserCols {
+    name: Vec<u8>, // per row: u32 length + bytes
+    day: Vec<i32>,
+    sessions: Vec<i32>,
+    events: Vec<i32>,
+    revenue: Vec<i64>,
+    top: Vec<u32>, // u32::MAX = null
 }
 
 /// Credited-campaign accumulator for one (campaign, day).
@@ -2038,7 +2042,7 @@ struct Worker {
     sess: Vec<Sess>, // sessions of the current person: [0, sess_n)
     sess_n: usize,
     runs: Vec<(u32, u32)>, // (day, first session idx)
-    rows: Vec<UserRow>,
+    rows: UserCols,
     // grouping scratch
     pmap: U64Map,
     pname: Vec<u64>,
@@ -2074,7 +2078,7 @@ impl Worker {
             sess: Vec::new(),
             sess_n: 0,
             runs: Vec::new(),
-            rows: Vec::new(),
+            rows: UserCols::default(),
             pmap: U64Map::with_capacity(1024),
             pname: Vec::new(),
             pnh: Vec::new(),
@@ -2165,7 +2169,8 @@ impl Worker {
             cmax_c = cmax_c.max(c);
         }
         // walk cells in time order
-        let row0 = self.rows.len();
+        let row0 = self.rows.day.len();
+        let nm = sget(name);
         let org = organic * self.nd;
         let mut k = 0usize; // sessions so far
         let mut prev_max: u32 = 0;
@@ -2178,14 +2183,13 @@ impl Worker {
         let mut r_purch = 0u32;
         macro_rules! flush_run {
             () => {
-                self.rows.push(UserRow {
-                    name,
-                    day: (base_day_off + day as i64) as i32,
-                    sessions: (k - r_first) as u32,
-                    events: r_events,
-                    revenue: r_rev,
-                    top: u32::MAX,
-                });
+                self.rows.name.extend_from_slice(&(nm.len() as u32).to_le_bytes());
+                self.rows.name.extend_from_slice(nm);
+                self.rows.day.push((base_day_off + day as i64) as i32);
+                self.rows.sessions.push((k - r_first) as i32);
+                self.rows.events.push(r_events as i32);
+                self.rows.revenue.push(r_rev as i64);
+                self.rows.top.push(u32::MAX);
                 if direct {
                     let st = unsafe { self.cstat.get_unchecked_mut(org + (day - self.dshift) as usize) };
                     st.sessions += (k - r_first) as u32;
@@ -2262,7 +2266,7 @@ impl Worker {
             let e = self.purch[0];
             let ts = (e >> 32) as u32;
             let r = unsafe { (*sess.add((*cells.add((ts / GAP_MS) as usize)).sess as usize)).run } as usize;
-            self.rows[row0 + r].top = e as u32 >> 24;
+            self.rows.top[row0 + r] = e as u32 >> 24;
         } else if np > 1 {
             let ncat = self.ncat;
             for i in 0..np {
@@ -2273,7 +2277,7 @@ impl Worker {
                 self.dcat[d * ncat + (meta >> 24) as usize] += (meta & 0xFF_FFFF) as u64;
             }
             for r in 0..self.runs.len() {
-                if self.rows[row0 + r].revenue > 0 {
+                if self.rows.revenue[row0 + r] > 0 {
                     let day = self.runs[r].0 as usize;
                     let row = &mut self.dcat[day * ncat..(day + 1) * ncat];
                     let mut best = 0u64;
@@ -2285,7 +2289,7 @@ impl Worker {
                         }
                         *v = 0;
                     }
-                    self.rows[row0 + r].top = top;
+                    self.rows.top[row0 + r] = top;
                 }
             }
         }
@@ -2474,6 +2478,10 @@ impl Worker {
                 sort_clicks(cls);
             }
             let name = ut.name(qbase + p as u32);
+            // the name bytes (in the input text) are copied into the user_daily column
+            if let Some(r) = ut.uref.get(qbase as usize + p + 6) {
+                prefetch((r.load(Ordering::Relaxed) & ((1u64 << 47) - 1)) as *const u8);
+            }
             self.person(name, &ev_sorted[e0..e1], cls, base, base_day_off, organic);
         }
         self.ev_sorted = ev_sorted;
@@ -3297,15 +3305,26 @@ fn main() {
                     }
                     w.finalize_stats();
                     let rows = &w.rows;
-                    if !rows.is_empty() || t == 0 {
-                        let mut f = pq::Writer::new(rows.len(), rows.len() * 48 + 1024);
-                        f.str_col("user_id", rows.iter().map(|r| sget(r.name)));
-                        f.date_col("day", rows.iter().map(|r| r.day));
-                        f.i32_col("sessions", rows.iter().map(|r| r.sessions as i32));
-                        f.i32_col("events", rows.iter().map(|r| r.events as i32));
-                        f.i64_col("revenue_cents", rows.iter().map(|r| r.revenue as i64));
-                        f.dict_col("top_category", cats, rows.iter().map(|r| r.top));
-                        fs::write(ud.join(format!("part-{t:03}.parquet")), f.finish()).expect("write user_daily");
+                    let nrows = rows.day.len();
+                    if nrows != 0 || t == 0 {
+                        // the plain columns are already page bodies: only headers, the
+                        // dictionary column and the footer are encoded here
+                        let mut f = pq::Writer::new(nrows, nrows / 2 + 4096);
+                        f.raw_col("user_id", 0, &rows.name);
+                        f.raw_col("day", 1, pq::le_bytes(&rows.day));
+                        f.raw_col("sessions", 2, pq::le_bytes(&rows.sessions));
+                        f.raw_col("events", 2, pq::le_bytes(&rows.events));
+                        f.raw_col("revenue_cents", 3, pq::le_bytes(&rows.revenue));
+                        f.dict_col("top_category", cats, rows.top.iter().copied());
+                        let (own, segs) = f.finish_parts();
+                        let mut file = fs::File::create(ud.join(format!("part-{t:03}.parquet"))).expect("write user_daily");
+                        let mut at = 0usize;
+                        for (pos, seg) in segs {
+                            file.write_all(&own[at..pos]).expect("write user_daily");
+                            file.write_all(seg).expect("write user_daily");
+                            at = pos;
+                        }
+                        file.write_all(&own[at..]).expect("write user_daily");
                     }
                     w
                 })
